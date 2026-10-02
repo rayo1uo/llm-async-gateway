@@ -30,7 +30,10 @@ if #ids == 0 then
   return ''
 end
 local id = ids[1]
-redis.call('ZREM', KEYS[1], id)
+local removed = redis.call('ZREM', KEYS[1], id)
+if removed == 0 then
+  return ''
+end
 redis.call('ZADD', KEYS[2], ARGV[1], id .. '|' .. ARGV[2])
 return id
 `)
@@ -102,6 +105,91 @@ for _, id in ipairs(ids) do
   end
 end
 return n
+`)
+
+// KEYS: queue, expired list
+// ARGV: now ms, result prefix
+// Moves ready units whose deadline has passed onto the expired list.
+// This does not take a dispatch slot.
+var expireReadyScript = redis.NewScript(`
+local now = tonumber(ARGV[1])
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 32)
+local n = 0
+for _, id in ipairs(ids) do
+  local removed = redis.call('ZREM', KEYS[1], id)
+  if removed == 1 then
+    if redis.call('EXISTS', ARGV[2] .. id) == 0 then
+      redis.call('LPUSH', KEYS[2], id)
+    end
+    n = n + 1
+  end
+end
+return n
+`)
+
+// KEYS: inputs, unit, queue, outstanding, deadline hash, tier hash
+// ARGV: expected head, unit JSON, score, id, tier, window
+// Pops the head only when it still matches and the window has room, and enqueues it.
+var commitInputScript = redis.NewScript(`
+local outstanding = tonumber(redis.call('GET', KEYS[4]) or '0')
+if outstanding >= tonumber(ARGV[6]) then
+  return 'full'
+end
+local head = redis.call('LINDEX', KEYS[1], 0)
+if not head then
+  return 'empty'
+end
+if head ~= ARGV[1] then
+  return 'retry'
+end
+redis.call('LPOP', KEYS[1])
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
+redis.call('HSET', KEYS[5], ARGV[4], ARGV[3])
+redis.call('HSET', KEYS[6], ARGV[4], ARGV[5])
+redis.call('INCR', KEYS[4])
+return 'ok'
+`)
+
+// KEYS: inputs, result, lines hash, counts hash
+// ARGV: expected head, result JSON, ttl seconds, customID, line JSON, count field
+// Pops the head and records a terminal line in one script.
+var commitTerminalScript = redis.NewScript(`
+local head = redis.call('LINDEX', KEYS[1], 0)
+if not head then
+  return 'empty'
+end
+if head ~= ARGV[1] then
+  return 'retry'
+end
+redis.call('LPOP', KEYS[1])
+if redis.call('EXISTS', KEYS[2]) == 0 then
+  redis.call('SET', KEYS[2], ARGV[2], 'EX', tonumber(ARGV[3]))
+  local added = redis.call('HSETNX', KEYS[3], ARGV[4], ARGV[5])
+  if added == 1 then
+    redis.call('HINCRBY', KEYS[4], ARGV[6], 1)
+  end
+end
+return 'ok'
+`)
+
+// KEYS: idem, nearline, unit, queue, deadline hash, tier hash
+// ARGV: useIdem, request id, nearline JSON, unit JSON, score, tier, ttl seconds
+// Creates the idempotency key, the nearline record, and the queued unit together.
+var acceptNearlineScript = redis.NewScript(`
+if ARGV[1] == '1' then
+  local cur = redis.call('GET', KEYS[1])
+  if cur and cur ~= '' then
+    return 'exists:' .. cur
+  end
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[7]))
+end
+redis.call('SET', KEYS[2], ARGV[3])
+redis.call('SET', KEYS[3], ARGV[4])
+redis.call('ZADD', KEYS[4], ARGV[5], ARGV[2])
+redis.call('HSET', KEYS[5], ARGV[2], ARGV[5])
+redis.call('HSET', KEYS[6], ARGV[2], ARGV[6])
+return 'created:' .. ARGV[2]
 `)
 
 // KEYS: result, lines hash, counts hash, outstanding, claimed

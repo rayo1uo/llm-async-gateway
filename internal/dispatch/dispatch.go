@@ -109,8 +109,17 @@ func (d *Dispatcher) tick(ctx context.Context) {
 	if _, err := d.store.PromoteRetries(ctx, now); err != nil {
 		d.log.Error("promote retries", "err", err)
 	}
+	d.expireReady(ctx, now)
 	d.drainExpired(ctx)
 	d.pump(ctx)
+}
+
+func (d *Dispatcher) expireReady(ctx context.Context, now time.Time) {
+	for _, tier := range []model.Tier{model.TierNearline, model.TierBatch} {
+		if _, err := d.store.ExpireReady(ctx, tier, now); err != nil {
+			d.log.Error("expire ready", "tier", tier, "err", err)
+		}
+	}
 }
 
 func (d *Dispatcher) drainExpired(ctx context.Context) {
@@ -147,12 +156,30 @@ func (d *Dispatcher) pump(ctx context.Context) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		tier, ok := d.choose(ctx)
-		if !ok {
+		order, err := d.candidateTiers(ctx)
+		if err != nil {
+			d.log.Error("candidate tiers", "err", err)
 			return
 		}
-		release, ok := d.budget.Allow(ctx, tier)
-		if !ok {
+		if len(order) == 0 {
+			return
+		}
+		var (
+			tier    model.Tier
+			release func()
+			granted bool
+		)
+		for _, candidate := range order {
+			rel, ok := d.budget.Allow(ctx, candidate)
+			if !ok {
+				continue
+			}
+			tier = candidate
+			release = rel
+			granted = true
+			break
+		}
+		if !granted {
 			return
 		}
 		owner, err := id.New("own_")
@@ -177,6 +204,28 @@ func (d *Dispatcher) pump(ctx context.Context) {
 			d.process(u, owner)
 		}(unit, owner, release)
 	}
+}
+
+// candidateTiers returns the preferred tier, then the other tier when it also
+// has ready work. A budget refusal for the first tier must not skip the second.
+func (d *Dispatcher) candidateTiers(ctx context.Context) ([]model.Tier, error) {
+	preferred, ok := d.choose(ctx)
+	if !ok {
+		return nil, nil
+	}
+	order := []model.Tier{preferred}
+	other := model.TierBatch
+	if preferred == model.TierBatch {
+		other = model.TierNearline
+	}
+	n, err := d.store.QueueLen(ctx, other)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		order = append(order, other)
+	}
+	return order, nil
 }
 
 func (d *Dispatcher) choose(ctx context.Context) (model.Tier, bool) {

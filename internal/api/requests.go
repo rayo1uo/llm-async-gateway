@@ -69,28 +69,16 @@ func (h *Handler) createRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idemKey := r.Header.Get("Idempotency-Key")
+	if len(idemKey) > 200 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key is too long", "invalid_request_error")
+		return
+	}
 	reqID, err := id.New("req_")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error", "api_error")
 		return
 	}
-	if key := r.Header.Get("Idempotency-Key"); key != "" {
-		if len(key) > 200 {
-			writeError(w, http.StatusBadRequest, "Idempotency-Key is too long", "invalid_request_error")
-			return
-		}
-		existing, created, err := h.store.ReserveIdempotency(r.Context(), key, reqID, h.opts.IdempotencyTTL)
-		if err != nil {
-			h.log.Error("idempotency", "err", err)
-			writeError(w, http.StatusInternalServerError, "internal error", "api_error")
-			return
-		}
-		if !created {
-			h.writeExisting(w, r, existing)
-			return
-		}
-	}
-
 	now := h.now()
 	rec := &model.Nearline{
 		ID:         reqID,
@@ -110,14 +98,14 @@ func (h *Handler) createRequest(w http.ResponseWriter, r *http.Request) {
 		Deadline: rec.DeadlineMS,
 		Created:  now.UnixMilli(),
 	}
-	if err := h.store.PutNearline(r.Context(), rec); err != nil {
-		h.log.Error("put nearline", "err", err)
+	id, created, err := h.store.AcceptNearline(r.Context(), idemKey, h.opts.IdempotencyTTL, rec, unit)
+	if err != nil {
+		h.log.Error("accept nearline", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error", "api_error")
 		return
 	}
-	if err := h.store.Enqueue(r.Context(), unit); err != nil {
-		h.log.Error("enqueue nearline", "err", err)
-		writeError(w, http.StatusInternalServerError, "internal error", "api_error")
+	if !created {
+		h.writeExisting(w, r, id)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, viewFrom(rec, nil))

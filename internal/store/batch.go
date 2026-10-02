@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -142,6 +143,75 @@ func (s *Store) BatchInputLen(ctx context.Context, batchID string) (int64, error
 		return 0, fmt.Errorf("input len: %w", err)
 	}
 	return n, nil
+}
+
+// PeekBatchInput returns the raw head of the input list and its decoded line.
+// A nil line means the list is empty. raw is the exact Redis value and must be
+// passed back to CommitBatchInput or CommitBatchTerminal.
+func (s *Store) PeekBatchInput(ctx context.Context, batchID string) (string, *model.InputLine, error) {
+	raw, err := s.rdb.LIndex(ctx, s.inputsKey(batchID), 0).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("peek input: %w", err)
+	}
+	var line model.InputLine
+	if err := json.Unmarshal([]byte(raw), &line); err != nil {
+		return "", nil, fmt.Errorf("decode input: %w", err)
+	}
+	return raw, &line, nil
+}
+
+// CommitBatchInput enqueues unit and removes the matching input head in one script.
+// status is ok, full (window reached), empty, or retry (the head changed).
+func (s *Store) CommitBatchInput(ctx context.Context, batchID, expectedHead string, u *model.Unit, window int) (string, error) {
+	if window < 1 {
+		window = 1
+	}
+	raw, err := json.Marshal(u)
+	if err != nil {
+		return "", fmt.Errorf("encode unit: %w", err)
+	}
+	status, err := commitInputScript.Run(ctx, s.rdb, []string{
+		s.inputsKey(batchID),
+		s.unitKey(u.ID),
+		s.queueKey(u.Tier),
+		s.outstandingKey(batchID),
+		s.deadlineHash(),
+		s.tierHash(),
+	}, expectedHead, string(raw), strconv.FormatInt(u.Deadline, 10), u.ID, string(u.Tier), strconv.Itoa(window)).Text()
+	if err != nil {
+		return "", fmt.Errorf("commit input: %w", err)
+	}
+	return status, nil
+}
+
+// CommitBatchTerminal removes the matching input head and stores a terminal batch line.
+// The line was never queued, so outstanding is unchanged.
+func (s *Store) CommitBatchTerminal(ctx context.Context, batchID, expectedHead string, u *model.Unit, res *model.Result, line *model.OutputLine, ttl time.Duration) (string, error) {
+	resRaw, err := json.Marshal(res)
+	if err != nil {
+		return "", fmt.Errorf("encode result: %w", err)
+	}
+	lineRaw, err := json.Marshal(line)
+	if err != nil {
+		return "", fmt.Errorf("encode output line: %w", err)
+	}
+	ttlSec := int(ttl.Seconds())
+	if ttlSec < 1 {
+		ttlSec = 1
+	}
+	status, err := commitTerminalScript.Run(ctx, s.rdb, []string{
+		s.inputsKey(batchID),
+		s.resultKey(u.ID),
+		s.linesKey(batchID),
+		s.countsKey(batchID),
+	}, expectedHead, string(resRaw), strconv.Itoa(ttlSec), line.CustomID, string(lineRaw), model.CountFailed).Text()
+	if err != nil {
+		return "", fmt.Errorf("commit terminal: %w", err)
+	}
+	return status, nil
 }
 
 // PopBatchInput removes the next input line. A nil line means the list is empty.

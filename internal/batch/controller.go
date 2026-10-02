@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -191,68 +190,92 @@ func (c *Controller) progress(ctx context.Context, b *model.Batch) error {
 }
 
 func (c *Controller) fill(ctx context.Context, b *model.Batch, deadlineMS int64) error {
-	outstanding, err := c.store.Outstanding(ctx, b.ID)
-	if err != nil {
-		return err
-	}
-	room := c.opts.Window - int(outstanding)
-	for i := 0; i < room; i++ {
-		line, err := c.store.PopBatchInput(ctx, b.ID)
+	retries := 0
+	for {
+		status, err := c.enqueueHead(ctx, b.ID, deadlineMS)
 		if err != nil {
 			return err
 		}
-		if line == nil {
-			break
-		}
-		uid, err := id.New("batch_req_")
-		if err != nil {
-			_ = c.store.PushBatchInputFront(ctx, b.ID, line)
-			return err
-		}
-		unit := &model.Unit{
-			ID:        uid,
-			Tier:      model.TierBatch,
-			Endpoint:  line.URL,
-			Body:      line.Body,
-			Deadline:  deadlineMS,
-			Created:   c.clk.Now().UnixMilli(),
-			BatchID:   b.ID,
-			CustomID:  line.CustomID,
-			LineIndex: line.Index,
-		}
-		if err := c.store.Enqueue(ctx, unit); err != nil {
-			if pushErr := c.store.PushBatchInputFront(ctx, b.ID, line); pushErr != nil {
-				return errors.Join(err, pushErr)
+		switch status {
+		case "ok":
+			retries = 0
+		case "retry":
+			retries++
+			if retries > 8 {
+				return fmt.Errorf("batch %s input head kept changing", b.ID)
 			}
-			return err
+		case "full", "empty":
+			return c.publishCounts(ctx, b.ID)
+		default:
+			return fmt.Errorf("batch %s enqueue status %q", b.ID, status)
 		}
 	}
-	return c.publishCounts(ctx, b.ID)
+}
+
+func (c *Controller) enqueueHead(ctx context.Context, batchID string, deadlineMS int64) (string, error) {
+	raw, line, err := c.store.PeekBatchInput(ctx, batchID)
+	if err != nil {
+		return "", err
+	}
+	if line == nil {
+		return "empty", nil
+	}
+	uid, err := id.New("batch_req_")
+	if err != nil {
+		return "", err
+	}
+	unit := &model.Unit{
+		ID:        uid,
+		Tier:      model.TierBatch,
+		Endpoint:  line.URL,
+		Body:      line.Body,
+		Deadline:  deadlineMS,
+		Created:   c.clk.Now().UnixMilli(),
+		BatchID:   batchID,
+		CustomID:  line.CustomID,
+		LineIndex: line.Index,
+	}
+	return c.store.CommitBatchInput(ctx, batchID, raw, unit, c.opts.Window)
 }
 
 func (c *Controller) skipRemaining(ctx context.Context, batchID, code, status, message string) error {
+	retries := 0
 	for {
-		line, err := c.store.PopBatchInput(ctx, batchID)
+		raw, line, err := c.store.PeekBatchInput(ctx, batchID)
 		if err != nil {
 			return err
 		}
 		if line == nil {
 			break
 		}
-		if err := c.recordSkipped(ctx, batchID, line, code, status, message); err != nil {
-			if pushErr := c.store.PushBatchInputFront(ctx, batchID, line); pushErr != nil {
-				return errors.Join(err, pushErr)
-			}
+		got, err := c.recordSkipped(ctx, batchID, raw, line, code, status, message)
+		if err != nil {
 			return err
+		}
+		switch got {
+		case "ok":
+			retries = 0
+		case "retry":
+			retries++
+			if retries > 8 {
+				return fmt.Errorf("batch %s input head kept changing", batchID)
+			}
+		case "empty":
+			retries = 0
+		default:
+			return fmt.Errorf("batch %s terminal status %q", batchID, got)
+		}
+		if got == "empty" {
+			break
 		}
 	}
 	return c.publishCounts(ctx, batchID)
 }
 
-func (c *Controller) recordSkipped(ctx context.Context, batchID string, line *model.InputLine, code, status, message string) error {
+func (c *Controller) recordSkipped(ctx context.Context, batchID, raw string, line *model.InputLine, code, status, message string) (string, error) {
 	uid, err := id.New("batch_req_")
 	if err != nil {
-		return err
+		return "", err
 	}
 	now := c.clk.Now().Unix()
 	res := &model.Result{
@@ -268,8 +291,7 @@ func (c *Controller) recordSkipped(ctx context.Context, batchID string, line *mo
 		Error:    &model.OutputError{Code: code, Message: message},
 	}
 	unit := &model.Unit{ID: uid, BatchID: batchID, CustomID: line.CustomID, Tier: model.TierBatch}
-	_, err = c.store.Finish(ctx, unit, "", res, out, model.CountFailed, false, c.opts.ResultTTL)
-	return err
+	return c.store.CommitBatchTerminal(ctx, batchID, raw, unit, res, out, c.opts.ResultTTL)
 }
 
 func (c *Controller) publishCounts(ctx context.Context, id string) error {
@@ -436,19 +458,35 @@ func sumUsage(lines []model.OutputLine) *model.Usage {
 			Usage struct {
 				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
+				InputTokens      int `json:"input_tokens"`
+				OutputTokens     int `json:"output_tokens"`
 				TotalTokens      int `json:"total_tokens"`
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal(ln.Response.Body, &body); err != nil {
 			continue
 		}
-		if body.Usage.PromptTokens == 0 && body.Usage.CompletionTokens == 0 && body.Usage.TotalTokens == 0 {
+		// Chat Completions reports prompt/completion tokens. The Responses API
+		// reports input/output tokens. Embeddings often sets only prompt and total.
+		in := body.Usage.PromptTokens
+		if in == 0 {
+			in = body.Usage.InputTokens
+		}
+		out := body.Usage.CompletionTokens
+		if out == 0 {
+			out = body.Usage.OutputTokens
+		}
+		total := body.Usage.TotalTokens
+		if total == 0 {
+			total = in + out
+		}
+		if in == 0 && out == 0 && total == 0 {
 			continue
 		}
 		found = true
-		usage.InputTokens += body.Usage.PromptTokens
-		usage.OutputTokens += body.Usage.CompletionTokens
-		usage.TotalTokens += body.Usage.TotalTokens
+		usage.InputTokens += in
+		usage.OutputTokens += out
+		usage.TotalTokens += total
 	}
 	if !found {
 		return nil

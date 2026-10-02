@@ -148,6 +148,19 @@ func (s *Store) Reclaim(ctx context.Context, now time.Time) (int, error) {
 	return n, nil
 }
 
+// ExpireReady moves up to 32 ready units in tier whose deadline is at or before now
+// onto the expired list. It does not acquire a dispatch budget.
+func (s *Store) ExpireReady(ctx context.Context, tier model.Tier, now time.Time) (int, error) {
+	n, err := expireReadyScript.Run(ctx, s.rdb, []string{s.queueKey(tier), s.expiredKey()},
+		strconv.FormatInt(now.UnixMilli(), 10),
+		s.resultPrefix(),
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("expire ready: %w", err)
+	}
+	return n, nil
+}
+
 // PromoteRetries moves parked retries whose wait has elapsed back onto the ready queue.
 func (s *Store) PromoteRetries(ctx context.Context, now time.Time) (int, error) {
 	n, err := promoteScript.Run(ctx, s.rdb, []string{s.retryKey(), s.expiredKey()},

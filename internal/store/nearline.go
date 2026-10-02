@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rayo1uo/llm-async-gateway/internal/model"
@@ -49,18 +52,46 @@ func (s *Store) SetNearlineStatus(ctx context.Context, id, status string, atUnix
 	return s.setJSON(ctx, s.nearlineKey(id), &n)
 }
 
-// ReserveIdempotency claims key for id. When created is false, existing is the prior id.
-func (s *Store) ReserveIdempotency(ctx context.Context, key, requestID string, ttl time.Duration) (existing string, created bool, err error) {
-	ok, err := s.rdb.SetNX(ctx, s.idemKey(key), requestID, ttl).Result()
+// AcceptNearline stores the idempotency key, the nearline record, and the queued unit
+// in one script. When the key was already claimed, created is false and id is the
+// original request id; the record and unit from that first call are already present.
+// idemKey empty skips the idempotency check.
+func (s *Store) AcceptNearline(ctx context.Context, idemKey string, ttl time.Duration, rec *model.Nearline, unit *model.Unit) (id string, created bool, err error) {
+	recRaw, err := json.Marshal(rec)
 	if err != nil {
-		return "", false, fmt.Errorf("idempotency: %w", err)
+		return "", false, fmt.Errorf("encode nearline: %w", err)
 	}
-	if ok {
-		return requestID, true, nil
-	}
-	prev, err := s.rdb.Get(ctx, s.idemKey(key)).Result()
+	unitRaw, err := json.Marshal(unit)
 	if err != nil {
-		return "", false, fmt.Errorf("idempotency read: %w", err)
+		return "", false, fmt.Errorf("encode unit: %w", err)
 	}
-	return prev, false, nil
+	use := "0"
+	key := s.key("noop")
+	if idemKey != "" {
+		use = "1"
+		key = s.idemKey(idemKey)
+	}
+	ttlSec := int(ttl.Seconds())
+	if ttlSec < 1 {
+		ttlSec = 1
+	}
+	raw, err := acceptNearlineScript.Run(ctx, s.rdb, []string{
+		key,
+		s.nearlineKey(rec.ID),
+		s.unitKey(unit.ID),
+		s.queueKey(unit.Tier),
+		s.deadlineHash(),
+		s.tierHash(),
+	}, use, rec.ID, string(recRaw), string(unitRaw), strconv.FormatInt(unit.Deadline, 10), string(unit.Tier), strconv.Itoa(ttlSec)).Text()
+	if err != nil {
+		return "", false, fmt.Errorf("accept nearline: %w", err)
+	}
+	switch {
+	case strings.HasPrefix(raw, "created:"):
+		return strings.TrimPrefix(raw, "created:"), true, nil
+	case strings.HasPrefix(raw, "exists:"):
+		return strings.TrimPrefix(raw, "exists:"), false, nil
+	default:
+		return "", false, fmt.Errorf("accept nearline: unexpected reply %q", raw)
+	}
 }
