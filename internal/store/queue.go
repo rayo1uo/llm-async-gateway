@@ -1,0 +1,263 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/rayo1uo/llm-async-gateway/internal/model"
+)
+
+func (s *Store) unitKey(id string) string        { return s.key("unit", id) }
+func (s *Store) queueKey(tier model.Tier) string { return s.key("q", string(tier)) }
+func (s *Store) claimedKey() string              { return s.key("claimed") }
+func (s *Store) retryKey() string                { return s.key("retry") }
+func (s *Store) expiredKey() string              { return s.key("expired") }
+func (s *Store) deadlineHash() string            { return s.key("meta", "deadline") }
+func (s *Store) tierHash() string                { return s.key("meta", "tier") }
+func (s *Store) resultKey(id string) string      { return s.key("result", id) }
+func (s *Store) resultPrefix() string            { return s.prefix + ":result:" }
+func (s *Store) queuePrefix() string             { return s.prefix + ":q:" }
+func (s *Store) cancelKey(id string) string      { return s.key("cancel", id) }
+
+// Enqueue persists a unit and inserts it into its tier sorted set, scored by deadline.
+// Batch units also increment the batch outstanding counter.
+func (s *Store) Enqueue(ctx context.Context, u *model.Unit) error {
+	if !u.Tier.Valid() {
+		return fmt.Errorf("invalid tier %q", u.Tier)
+	}
+	raw, err := json.Marshal(u)
+	if err != nil {
+		return fmt.Errorf("encode unit: %w", err)
+	}
+	incr := "0"
+	outstanding := s.key("noop")
+	if u.BatchID != "" {
+		incr = "1"
+		outstanding = s.outstandingKey(u.BatchID)
+	}
+	_, err = enqueueScript.Run(ctx, s.rdb, []string{
+		s.unitKey(u.ID),
+		s.queueKey(u.Tier),
+		outstanding,
+		s.deadlineHash(),
+		s.tierHash(),
+	}, string(raw), strconv.FormatInt(u.Deadline, 10), u.ID, string(u.Tier), incr).Result()
+	if err != nil {
+		return fmt.Errorf("enqueue: %w", err)
+	}
+	return nil
+}
+
+// GetUnit loads a queued request.
+func (s *Store) GetUnit(ctx context.Context, id string) (*model.Unit, error) {
+	var u model.Unit
+	if err := s.getJSON(ctx, s.unitKey(id), &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// SaveUnit overwrites the unit document without moving it between queues.
+func (s *Store) SaveUnit(ctx context.Context, u *model.Unit) error {
+	if err := s.setJSON(ctx, s.unitKey(u.ID), u); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Claim leases the earliest-deadline unit in tier. A nil unit means the queue is empty.
+func (s *Store) Claim(ctx context.Context, tier model.Tier, leaseUntil time.Time, owner string) (*model.Unit, error) {
+	raw, err := claimScript.Run(ctx, s.rdb, []string{s.queueKey(tier), s.claimedKey()},
+		strconv.FormatInt(leaseUntil.UnixMilli(), 10), owner).Text()
+	if errors.Is(err, redis.Nil) || raw == "" {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim: %w", err)
+	}
+	u, err := s.GetUnit(ctx, raw)
+	if err != nil {
+		return nil, fmt.Errorf("claim load unit: %w", err)
+	}
+	return u, nil
+}
+
+// ExtendLease pushes a claim's visibility timeout forward. ok is false when this owner lost the lease.
+func (s *Store) ExtendLease(ctx context.Context, id, owner string, until time.Time) (bool, error) {
+	n, err := extendScript.Run(ctx, s.rdb, []string{s.claimedKey()},
+		id, owner, strconv.FormatInt(until.UnixMilli(), 10)).Int()
+	if err != nil {
+		return false, fmt.Errorf("extend lease: %w", err)
+	}
+	return n == 1, nil
+}
+
+// ParkRetry releases the claim and hides the unit until until.
+func (s *Store) ParkRetry(ctx context.Context, u *model.Unit, owner string, until time.Time) error {
+	raw, err := json.Marshal(u)
+	if err != nil {
+		return fmt.Errorf("encode unit: %w", err)
+	}
+	_, err = parkScript.Run(ctx, s.rdb, []string{s.claimedKey(), s.unitKey(u.ID), s.retryKey()},
+		u.ID, owner, string(raw), strconv.FormatInt(until.UnixMilli(), 10)).Result()
+	if err != nil {
+		return fmt.Errorf("park retry: %w", err)
+	}
+	return nil
+}
+
+// QueueLen returns ready (not claimed, not parked) units in a tier.
+func (s *Store) QueueLen(ctx context.Context, tier model.Tier) (int64, error) {
+	n, err := s.rdb.ZCard(ctx, s.queueKey(tier)).Result()
+	if err != nil {
+		return 0, fmt.Errorf("queue len: %w", err)
+	}
+	return n, nil
+}
+
+// EarliestDeadline returns the smallest deadline currently ready in tier.
+func (s *Store) EarliestDeadline(ctx context.Context, tier model.Tier) (time.Time, bool, error) {
+	zs, err := s.rdb.ZRangeWithScores(ctx, s.queueKey(tier), 0, 0).Result()
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("earliest deadline: %w", err)
+	}
+	if len(zs) == 0 {
+		return time.Time{}, false, nil
+	}
+	return time.UnixMilli(int64(zs[0].Score)), true, nil
+}
+
+// Reclaim returns expired leases to their tier queue, or to the expired list when the deadline has passed.
+func (s *Store) Reclaim(ctx context.Context, now time.Time) (int, error) {
+	n, err := reclaimScript.Run(ctx, s.rdb, []string{s.claimedKey(), s.expiredKey()},
+		strconv.FormatInt(now.UnixMilli(), 10),
+		s.resultPrefix(),
+		s.deadlineHash(),
+		s.tierHash(),
+		s.queuePrefix(),
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("reclaim: %w", err)
+	}
+	return n, nil
+}
+
+// PromoteRetries moves parked retries whose wait has elapsed back onto the ready queue.
+func (s *Store) PromoteRetries(ctx context.Context, now time.Time) (int, error) {
+	n, err := promoteScript.Run(ctx, s.rdb, []string{s.retryKey(), s.expiredKey()},
+		strconv.FormatInt(now.UnixMilli(), 10),
+		s.resultPrefix(),
+		s.deadlineHash(),
+		s.tierHash(),
+		s.queuePrefix(),
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("promote retries: %w", err)
+	}
+	return n, nil
+}
+
+// PopExpired removes one id whose deadline passed while it was leased or parked.
+// An empty id means the list is empty.
+func (s *Store) PopExpired(ctx context.Context) (string, error) {
+	id, err := s.rdb.RPop(ctx, s.expiredKey()).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("pop expired: %w", err)
+	}
+	return id, nil
+}
+
+// Finish records a terminal result exactly once and releases the claim.
+// created is false when a result for this unit already existed.
+// decrOutstanding should be true only for units that passed through Enqueue.
+func (s *Store) Finish(ctx context.Context, u *model.Unit, owner string, res *model.Result, line *model.OutputLine, countField string, decrOutstanding bool, ttl time.Duration) (bool, error) {
+	resRaw, err := json.Marshal(res)
+	if err != nil {
+		return false, fmt.Errorf("encode result: %w", err)
+	}
+	isBatch := "0"
+	customID := ""
+	lineRaw := ""
+	linesKey := s.key("noop")
+	countsKey := s.key("noop")
+	outstanding := s.key("noop")
+	if u.BatchID != "" && line != nil {
+		isBatch = "1"
+		customID = line.CustomID
+		b, err := json.Marshal(line)
+		if err != nil {
+			return false, fmt.Errorf("encode output line: %w", err)
+		}
+		lineRaw = string(b)
+		linesKey = s.linesKey(u.BatchID)
+		countsKey = s.countsKey(u.BatchID)
+		outstanding = s.outstandingKey(u.BatchID)
+	}
+	decr := "0"
+	if decrOutstanding {
+		decr = "1"
+	}
+	ttlSec := int(ttl.Seconds())
+	if ttlSec < 1 {
+		ttlSec = 1
+	}
+	member := ""
+	if owner != "" {
+		member = u.ID + "|" + owner
+	}
+	n, err := finishScript.Run(ctx, s.rdb, []string{
+		s.resultKey(u.ID),
+		linesKey,
+		countsKey,
+		outstanding,
+		s.claimedKey(),
+	}, string(resRaw), strconv.Itoa(ttlSec), isBatch, customID, lineRaw, countField, member, decr).Int()
+	if err != nil {
+		return false, fmt.Errorf("finish: %w", err)
+	}
+	return n == 1, nil
+}
+
+// HasResult reports whether a terminal result is already stored.
+func (s *Store) HasResult(ctx context.Context, id string) (bool, error) {
+	n, err := s.rdb.Exists(ctx, s.resultKey(id)).Result()
+	if err != nil {
+		return false, fmt.Errorf("has result: %w", err)
+	}
+	return n == 1, nil
+}
+
+// GetResult loads a terminal result.
+func (s *Store) GetResult(ctx context.Context, id string) (*model.Result, error) {
+	var res model.Result
+	if err := s.getJSON(ctx, s.resultKey(id), &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// MarkCancelled sets the per-request cancel flag.
+func (s *Store) MarkCancelled(ctx context.Context, id string) error {
+	if err := s.rdb.Set(ctx, s.cancelKey(id), "1", 0).Err(); err != nil {
+		return fmt.Errorf("mark cancelled: %w", err)
+	}
+	return nil
+}
+
+// IsCancelled reports the per-request cancel flag.
+func (s *Store) IsCancelled(ctx context.Context, id string) (bool, error) {
+	n, err := s.rdb.Exists(ctx, s.cancelKey(id)).Result()
+	if err != nil {
+		return false, fmt.Errorf("cancel flag: %w", err)
+	}
+	return n == 1, nil
+}
