@@ -30,6 +30,14 @@ func TestValidateReservedSlots(t *testing.T) {
 	}
 }
 
+func TestUnknownGateFailsClosed(t *testing.T) {
+	cfg := Default()
+	cfg.Gates = "local,prometheus-budget"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("unknown gate_type should fail startup")
+	}
+}
+
 func TestLoadBadDuration(t *testing.T) {
 	t.Setenv("LEASE_TTL", "nope")
 	if _, err := Load(nil); err == nil {

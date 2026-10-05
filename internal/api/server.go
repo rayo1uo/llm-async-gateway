@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rayo1uo/llm-async-gateway/internal/clock"
+	"github.com/rayo1uo/llm-async-gateway/internal/observe"
 	"github.com/rayo1uo/llm-async-gateway/internal/store"
 )
 
@@ -19,6 +20,7 @@ type Options struct {
 	DefaultCompletionWindow time.Duration
 	DefaultNearlineDeadline time.Duration
 	IdempotencyTTL          time.Duration
+	Observer                *observe.Observer
 }
 
 // Handler is the HTTP API.
@@ -55,8 +57,25 @@ func New(st *store.Store, opts Options, logger *slog.Logger, clk clock.Clock) *H
 	return h
 }
 
+// Handle registers an extra route, such as /metrics, on the API mux.
+func (h *Handler) Handle(pattern string, handler http.Handler) {
+	h.mux.Handle(pattern, handler)
+}
+
+// HandleFunc registers an extra route on the API mux.
+func (h *Handler) HandleFunc(pattern string, fn http.HandlerFunc) {
+	h.mux.HandleFunc(pattern, fn)
+}
+
 // ServeHTTP implements http.Handler.
+// Every request is an http.serve span so POST /v1/requests can be continued
+// by the dispatcher via the W3C traceparent stored on the queue message.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.opts.Observer != nil {
+		ctx, span := h.opts.Observer.Start(r.Context(), "http.serve")
+		defer span.End()
+		r = r.WithContext(ctx)
+	}
 	h.mux.ServeHTTP(w, r)
 }
 

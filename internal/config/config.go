@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,7 @@ type Config struct {
 	RedisPassword           string
 	RedisDB                 int
 	KeyPrefix               string
+	Pool                    string
 	UpstreamURL             string
 	MaxConcurrency          int
 	ReservedBatchSlots      int
@@ -36,6 +38,8 @@ type Config struct {
 	RetryMax                time.Duration
 	MaxAttempts             int
 	LogLevel                string
+	ControllerLockTTL       time.Duration
+	Gates                   string
 }
 
 // Default returns demo-friendly settings.
@@ -44,6 +48,7 @@ func Default() Config {
 		Addr:                    ":8080",
 		RedisAddr:               "127.0.0.1:6379",
 		KeyPrefix:               "lag",
+		Pool:                    "default",
 		UpstreamURL:             "http://127.0.0.1:8090",
 		MaxConcurrency:          8,
 		ReservedBatchSlots:      1,
@@ -63,6 +68,8 @@ func Default() Config {
 		RetryMax:                30 * time.Second,
 		MaxAttempts:             8,
 		LogLevel:                "info",
+		ControllerLockTTL:       10 * time.Second,
+		Gates:                   "local",
 	}
 }
 
@@ -85,6 +92,9 @@ func Load(args []string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.KeyPrefix, err = envStr("KEY_PREFIX", cfg.KeyPrefix); err != nil {
+		return Config{}, err
+	}
+	if cfg.Pool, err = envStr("POOL", cfg.Pool); err != nil {
 		return Config{}, err
 	}
 	if cfg.UpstreamURL, err = envStr("UPSTREAM_URL", cfg.UpstreamURL); err != nil {
@@ -144,6 +154,12 @@ func Load(args []string) (Config, error) {
 	if cfg.LogLevel, err = envStr("LOG_LEVEL", cfg.LogLevel); err != nil {
 		return Config{}, err
 	}
+	if cfg.ControllerLockTTL, err = envDuration("CONTROLLER_LOCK_TTL", cfg.ControllerLockTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.Gates, err = envStr("GATES", cfg.Gates); err != nil {
+		return Config{}, err
+	}
 
 	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
 	fs.StringVar(&cfg.Addr, "addr", cfg.Addr, "HTTP listen address")
@@ -151,6 +167,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.RedisPassword, "redis-password", cfg.RedisPassword, "Redis password")
 	fs.IntVar(&cfg.RedisDB, "redis-db", cfg.RedisDB, "Redis database index")
 	fs.StringVar(&cfg.KeyPrefix, "key-prefix", cfg.KeyPrefix, "Redis key prefix")
+	fs.StringVar(&cfg.Pool, "pool", cfg.Pool, "inference pool name used in the Redis hash tag")
 	fs.StringVar(&cfg.UpstreamURL, "upstream-url", cfg.UpstreamURL, "OpenAI-compatible inference base URL")
 	fs.IntVar(&cfg.MaxConcurrency, "max-concurrency", cfg.MaxConcurrency, "maximum in-flight upstream calls")
 	fs.IntVar(&cfg.ReservedBatchSlots, "reserved-batch-slots", cfg.ReservedBatchSlots, "concurrency slots held back for batch")
@@ -170,6 +187,8 @@ func Load(args []string) (Config, error) {
 	fs.DurationVar(&cfg.RetryMax, "retry-max", cfg.RetryMax, "cap on exponential backoff")
 	fs.IntVar(&cfg.MaxAttempts, "max-attempts", cfg.MaxAttempts, "maximum upstream attempts before a request fails")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "slog level: debug, info, warn, error")
+	fs.DurationVar(&cfg.ControllerLockTTL, "controller-lock-ttl", cfg.ControllerLockTTL, "batch-controller leadership lease")
+	fs.StringVar(&cfg.Gates, "gates", cfg.Gates, "comma-separated gate types; Phase 1 accepts only local")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -189,6 +208,15 @@ func (c Config) Validate() error {
 	}
 	if c.KeyPrefix == "" {
 		return fmt.Errorf("key prefix is required")
+	}
+	if c.Pool == "" || strings.ContainsAny(c.Pool, "{}:") {
+		return fmt.Errorf("pool %q is invalid", c.Pool)
+	}
+	if _, err := c.GateList(); err != nil {
+		return err
+	}
+	if c.ControllerLockTTL <= 0 {
+		return fmt.Errorf("controller lock ttl must be > 0")
 	}
 	u, err := url.Parse(c.UpstreamURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -233,6 +261,25 @@ func (c Config) Validate() error {
 		return fmt.Errorf("log level %q is invalid", c.LogLevel)
 	}
 	return nil
+}
+
+// GateList parses GATES. Unknown names fail closed so a typo cannot disable admission.
+func (c Config) GateList() ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(c.Gates, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		if name != "local" {
+			return nil, fmt.Errorf("unknown gate_type %q", name)
+		}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("at least one gate is required")
+	}
+	return out, nil
 }
 
 func envStr(key, def string) (string, error) {

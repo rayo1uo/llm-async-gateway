@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rayo1uo/llm-async-gateway/internal/model"
+	"github.com/rayo1uo/llm-async-gateway/internal/observe"
 	"github.com/rayo1uo/llm-async-gateway/internal/retry"
 )
 
@@ -49,6 +50,11 @@ func (c *HTTPClient) Do(ctx context.Context, u *model.Unit) (*UpstreamResponse, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Request-Id", u.ID)
 	req.Header.Set("X-Async-Tier", string(u.Tier))
+	if tp := observe.Traceparent(ctx); tp != "" {
+		req.Header.Set("traceparent", tp)
+	} else if u.TraceParent != "" {
+		req.Header.Set("traceparent", u.TraceParent)
+	}
 	if u.BatchID != "" {
 		req.Header.Set("X-Batch-Id", u.BatchID)
 	}
@@ -114,6 +120,29 @@ func asJSON(b []byte) json.RawMessage {
 		return json.RawMessage(`""`)
 	}
 	return enc
+}
+
+func usageTokens(body []byte) (input, output int) {
+	var parsed struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			InputTokens      int `json:"input_tokens"`
+			OutputTokens     int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return 0, 0
+	}
+	input = parsed.Usage.PromptTokens
+	if input == 0 {
+		input = parsed.Usage.InputTokens
+	}
+	output = parsed.Usage.CompletionTokens
+	if output == 0 {
+		output = parsed.Usage.OutputTokens
+	}
+	return input, output
 }
 
 func trim(s string, n int) string {

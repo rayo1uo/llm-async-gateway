@@ -36,18 +36,26 @@ const (
 	ErrInvalidRequest   = "invalid_request"
 )
 
-// Tier is a strict priority lane. Nearline is dispatched ahead of batch,
-// except for the starvation guards in the scheduler.
+// Tier is a dispatch lane. Async is the POST /v1/requests lane. The queue
+// string used to be "nearline"; Phase 1 stores "async".
 type Tier string
 
 const (
-	TierNearline Tier = "nearline"
-	TierBatch    Tier = "batch"
+	TierInteractive Tier = "interactive"
+	TierAsync       Tier = "async"
+	TierBatch       Tier = "batch"
+	// TierNearline is the pre-Phase-1 name. It is the same lane as TierAsync.
+	TierNearline = TierAsync
 )
 
 // Valid reports whether the tier is one of the known lanes.
 func (t Tier) Valid() bool {
-	return t == TierNearline || t == TierBatch
+	switch t {
+	case TierInteractive, TierAsync, TierBatch:
+		return true
+	default:
+		return false
+	}
 }
 
 // File is an OpenAI Files API object. Bytes live in Redis for this demo.
@@ -139,19 +147,23 @@ type InputLine struct {
 	Index    int             `json:"index"`
 }
 
-// Unit is one queued inference request. Deadline is Unix milliseconds and is the
-// sorted-set score (earliest deadline first within a tier).
+// Unit is the in-process view of one queued inference.
+// The Redis document is a pipeline.Request. Deadline and Created are Unix seconds.
+// Deadline is also the ready-queue score (earliest deadline first within a tier).
+// Token is the fencing generation stored on pipeline.Request.RequestToken.
 type Unit struct {
-	ID        string          `json:"id"`
-	Tier      Tier            `json:"tier"`
-	Endpoint  string          `json:"endpoint"`
-	Body      json.RawMessage `json:"body"`
-	Deadline  int64           `json:"deadline"`
-	Created   int64           `json:"created"`
-	Attempts  int             `json:"attempts"`
-	BatchID   string          `json:"batch_id,omitempty"`
-	CustomID  string          `json:"custom_id,omitempty"`
-	LineIndex int             `json:"line_index,omitempty"`
+	ID          string
+	Tier        Tier
+	Endpoint    string
+	Body        json.RawMessage
+	Deadline    int64
+	Created     int64
+	Attempts    int
+	Token       string
+	TraceParent string
+	BatchID     string
+	CustomID    string
+	LineIndex   int
 }
 
 // Result is the terminal outcome of a unit.

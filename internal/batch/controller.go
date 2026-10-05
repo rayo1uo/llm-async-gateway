@@ -8,28 +8,37 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/rayo1uo/llm-async-gateway/internal/clock"
 	"github.com/rayo1uo/llm-async-gateway/internal/id"
 	"github.com/rayo1uo/llm-async-gateway/internal/jsonl"
 	"github.com/rayo1uo/llm-async-gateway/internal/model"
+	"github.com/rayo1uo/llm-async-gateway/internal/observe"
 	"github.com/rayo1uo/llm-async-gateway/internal/store"
 )
 
-// Options controls the per-batch enqueue window.
+// Options controls the per-batch enqueue window and the single-active lock.
 type Options struct {
 	Window       int
 	PollInterval time.Duration
 	ResultTTL    time.Duration
+	LockTTL      time.Duration
+	Observer     *observe.Observer
 }
 
-// Controller advances batch state machines.
+// Controller advances batch state machines. Run campaigns for a Redis lock
+// with a fencing token so only one replica reconciles.
 type Controller struct {
 	store *store.Store
 	opts  Options
 	log   *slog.Logger
 	clk   clock.Clock
+
+	mu    sync.RWMutex
+	owner string
+	token string
 }
 
 // New builds a controller. clk may be nil.
@@ -43,26 +52,140 @@ func New(st *store.Store, opts Options, logger *slog.Logger, clk clock.Clock) *C
 	if opts.Window < 1 {
 		opts.Window = 1
 	}
-	return &Controller{store: st, opts: opts, log: logger, clk: clk}
+	owner, err := id.New("ctl_")
+	if err != nil {
+		owner = "ctl_unknown"
+	}
+	return &Controller{store: st, opts: opts, log: logger, clk: clk, owner: owner}
 }
 
-// Run reconciles active batches until ctx is cancelled.
+// Leadership reports whether this process currently holds the controller lock.
+func (c *Controller) Leadership(ctx context.Context) (owner, token string, ok bool) {
+	c.mu.RLock()
+	owner, token = c.owner, c.token
+	c.mu.RUnlock()
+	if token == "" {
+		return owner, "", false
+	}
+	held, err := c.store.HasLead(ctx, token)
+	if err != nil || !held {
+		return owner, token, false
+	}
+	return owner, token, true
+}
+
+func (c *Controller) setToken(token string) {
+	c.mu.Lock()
+	c.token = token
+	c.mu.Unlock()
+}
+
+// Run campaigns for leadership and reconciles only while this process holds
+// the fencing token. A failed renewal stops the loop immediately.
 func (c *Controller) Run(ctx context.Context) {
-	c.reconcileAll(ctx)
-	ticker := time.NewTicker(c.opts.PollInterval)
+	ttl := c.opts.LockTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Second
+	}
+	interval := c.opts.PollInterval
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		token, ok, err := c.store.TryLead(ctx, c.owner, ttl)
+		if err != nil {
+			c.log.Error("controller campaign", "owner", c.owner, "err", err)
+		} else if ok {
+			c.lead(ctx, token, ttl)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.reconcileAll(context.Background())
 		}
 	}
 }
 
+func (c *Controller) lead(ctx context.Context, token string, ttl time.Duration) {
+	c.setToken(token)
+	defer c.setToken("")
+	lost := false
+	defer func() {
+		if lost {
+			return
+		}
+		relCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := c.store.ReleaseLead(relCtx, token); err != nil {
+			c.log.Error("release controller lock", "owner", c.owner, "err", err)
+		}
+	}()
+	c.log.Info("controller elected", "owner", c.owner, "token", token)
+	renewEvery := ttl / 3
+	if renewEvery < 10*time.Millisecond {
+		renewEvery = 10 * time.Millisecond
+	}
+	renew := time.NewTicker(renewEvery)
+	defer renew.Stop()
+	work := time.NewTicker(c.opts.PollInterval)
+	defer work.Stop()
+	if !c.renew(ctx, token, ttl) {
+		lost = true
+		return
+	}
+	c.reconcileAll(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-renew.C:
+			if !c.renew(ctx, token, ttl) {
+				lost = true
+				c.log.Warn("controller lost leadership", "owner", c.owner, "token", token)
+				return
+			}
+		case <-work.C:
+			if !c.renew(ctx, token, ttl) {
+				lost = true
+				c.log.Warn("controller lost leadership", "owner", c.owner, "token", token)
+				return
+			}
+			c.reconcileAll(ctx)
+		}
+	}
+}
+
+func (c *Controller) renew(ctx context.Context, token string, ttl time.Duration) bool {
+	ok, err := c.store.RenewLead(ctx, token, ttl)
+	if err != nil {
+		c.log.Error("renew controller lock", "owner", c.owner, "err", err)
+		return false
+	}
+	return ok
+}
+
+func (c *Controller) stillLeader(ctx context.Context) bool {
+	c.mu.RLock()
+	token := c.token
+	c.mu.RUnlock()
+	if token == "" {
+		// Direct calls from tests are not inside a campaign.
+		return true
+	}
+	ok, err := c.store.HasLead(ctx, token)
+	return err == nil && ok
+}
+
 func (c *Controller) reconcileAll(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
+		return
+	}
+	if !c.stillLeader(ctx) {
 		return
 	}
 	ids, err := c.store.ActiveBatchIDs(ctx)
@@ -89,6 +212,9 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 }
 
 func (c *Controller) reconcile(ctx context.Context, id string) error {
+	if !c.stillLeader(ctx) {
+		return nil
+	}
 	b, err := c.store.GetBatch(ctx, id)
 	if err != nil {
 		return err
@@ -117,6 +243,8 @@ func (c *Controller) reconcile(ctx context.Context, id string) error {
 }
 
 func (c *Controller) validate(ctx context.Context, b *model.Batch) error {
+	ctx, span := c.span(ctx, "batch.validate")
+	defer span.End()
 	body, err := c.store.GetFileContent(ctx, b.InputFileID)
 	if err != nil {
 		return c.fail(ctx, b.ID, model.BatchError{Code: "invalid_file", Message: "input file could not be read", Param: "input_file_id"})
@@ -204,6 +332,8 @@ func (c *Controller) fill(ctx context.Context, b *model.Batch, deadlineMS int64)
 			if retries > 8 {
 				return fmt.Errorf("batch %s input head kept changing", b.ID)
 			}
+		case "lost":
+			return nil
 		case "full", "empty":
 			return c.publishCounts(ctx, b.ID)
 		default:
@@ -213,6 +343,9 @@ func (c *Controller) fill(ctx context.Context, b *model.Batch, deadlineMS int64)
 }
 
 func (c *Controller) enqueueHead(ctx context.Context, batchID string, deadlineMS int64) (string, error) {
+	if !c.stillLeader(ctx) {
+		return "lost", nil
+	}
 	raw, line, err := c.store.PeekBatchInput(ctx, batchID)
 	if err != nil {
 		return "", err
@@ -229,12 +362,14 @@ func (c *Controller) enqueueHead(ctx context.Context, batchID string, deadlineMS
 		Tier:      model.TierBatch,
 		Endpoint:  line.URL,
 		Body:      line.Body,
-		Deadline:  deadlineMS,
-		Created:   c.clk.Now().UnixMilli(),
+		Deadline:  deadlineMS / 1000,
+		Created:   c.clk.Now().Unix(),
 		BatchID:   batchID,
 		CustomID:  line.CustomID,
 		LineIndex: line.Index,
 	}
+	ctx, span := c.span(ctx, "batch.enqueue")
+	defer span.End()
 	return c.store.CommitBatchInput(ctx, batchID, raw, unit, c.opts.Window)
 }
 
@@ -310,6 +445,11 @@ func (c *Controller) publishCounts(ctx context.Context, id string) error {
 }
 
 func (c *Controller) maybeFinalize(ctx context.Context, id string) error {
+	if !c.stillLeader(ctx) {
+		return nil
+	}
+	ctx, span := c.span(ctx, "batch.finalize")
+	defer span.End()
 	b, err := c.store.GetBatch(ctx, id)
 	if err != nil {
 		return err
@@ -492,6 +632,13 @@ func sumUsage(lines []model.OutputLine) *model.Usage {
 		return nil
 	}
 	return &usage
+}
+
+func (c *Controller) span(ctx context.Context, name string) (context.Context, *observe.Span) {
+	if c.opts.Observer == nil {
+		return ctx, nil
+	}
+	return c.opts.Observer.Start(ctx, name)
 }
 
 func hasCode(lines []model.OutputLine, code string) bool {

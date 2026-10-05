@@ -88,4 +88,12 @@ OUT_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["output_file_id
 echo "== batch output =="
 curl -sf "$BASE/v1/files/$OUT_ID/content"
 echo
+echo "== metrics =="
+METRICS=$(curl -sf "$BASE/metrics")
+for name in llm_async_gateway_queue_depth llm_async_gateway_inflight llm_async_gateway_attempts_total llm_async_gateway_deadline_slack_seconds; do
+  if ! grep -q "$name" <<<"$METRICS"; then
+    echo "metrics missing $name" >&2
+    exit 1
+  fi
+done
 echo "demo ok"

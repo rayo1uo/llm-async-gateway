@@ -11,17 +11,11 @@ import (
 	"github.com/rayo1uo/llm-async-gateway/internal/clock"
 	"github.com/rayo1uo/llm-async-gateway/internal/id"
 	"github.com/rayo1uo/llm-async-gateway/internal/model"
+	"github.com/rayo1uo/llm-async-gateway/internal/observe"
+	"github.com/rayo1uo/llm-async-gateway/internal/pipeline"
 	"github.com/rayo1uo/llm-async-gateway/internal/retry"
-	"github.com/rayo1uo/llm-async-gateway/internal/schedule"
 	"github.com/rayo1uo/llm-async-gateway/internal/store"
 )
-
-// Budget grants dispatch slots. release is called when the worker drops the slot.
-// Implementations include the local concurrency/rate limiter and, later, a
-// Prometheus saturation budget.
-type Budget interface {
-	Allow(ctx context.Context, tier model.Tier) (release func(), ok bool)
-}
 
 // UpstreamResponse is one attempt against the inference server.
 type UpstreamResponse struct {
@@ -47,54 +41,101 @@ type Options struct {
 	RetryBase      time.Duration
 	RetryMax       time.Duration
 	MaxAttempts    int
+	// Observer receives traces and metrics. Nil disables both.
+	Observer *observe.Observer
 }
 
-// Dispatcher is a single-process worker loop. Multiple goroutines share one queue
-// through claim leases, so a second replica can run the same loop safely.
+// Dispatcher runs inference workers on top of a pipeline.Flow.
+// The flow claims, admits, and parks retries. Workers call the upstream and
+// send retries and results back through the flow. Several processes can run
+// at once. The shared gate caps global in-flight work.
 type Dispatcher struct {
-	store  *store.Store
-	budget Budget
-	up     Upstream
-	opts   Options
-	log    *slog.Logger
-	clk    clock.Clock
-
-	mu     sync.Mutex
-	consec int
-	wg     sync.WaitGroup
+	store *store.Store
+	gate  pipeline.Gate
+	up    Upstream
+	opts  Options
+	log   *slog.Logger
+	clk   clock.Clock
+	flow  *redisFlow
+	pool  string
 }
 
 // New builds a dispatcher. clk may be nil to use the wall clock.
-func New(st *store.Store, budget Budget, up Upstream, opts Options, logger *slog.Logger, clk clock.Clock) *Dispatcher {
+// A nil gate fails closed: Apply refuses every request.
+func New(st *store.Store, gate pipeline.Gate, up Upstream, opts Options, logger *slog.Logger, clk clock.Clock) *Dispatcher {
 	if clk == nil {
 		clk = clock.Real{}
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Dispatcher{
-		store:  st,
-		budget: budget,
-		up:     up,
-		opts:   opts,
-		log:    logger,
-		clk:    clk,
+	if gate == nil {
+		gate = refuseGate{}
 	}
+	pool := "default"
+	if st != nil && st.Pool() != "" {
+		pool = st.Pool()
+	}
+	d := &Dispatcher{
+		store: st,
+		gate:  gate,
+		up:    up,
+		opts:  opts,
+		log:   logger,
+		clk:   clk,
+		pool:  pool,
+	}
+	d.flow = newFlow(d)
+	return d
 }
 
-// Run polls until ctx is cancelled, then waits for in-flight attempts.
+// Flow exposes the assembled pipeline. Tests and the process wiring use it.
+func (d *Dispatcher) Flow() pipeline.Flow { return d.flow }
+
+type refuseGate struct{}
+
+func (refuseGate) Budget(context.Context) float64 { return 0 }
+
+func (refuseGate) Apply(context.Context, *pipeline.Request, *[]pipeline.ReleaseFunc) (pipeline.Verdict, error) {
+	return pipeline.VerdictRefuse, nil
+}
+
+// Run merges the flow's request channels, starts inference workers, then
+// starts the flow. Canceling ctx stops new claims. In-flight attempts finish,
+// and only then does the flow shut down its retry and result workers.
 func (d *Dispatcher) Run(ctx context.Context) {
-	d.tick(ctx)
-	ticker := time.NewTicker(d.opts.PollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			d.wg.Wait()
-			return
-		case <-ticker.C:
-			d.tick(context.Background())
-		}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out := d.flow.merge.MergeRequestChannels(d.flow.RequestChannels())
+	var wg sync.WaitGroup
+	for _, ch := range out.Channels {
+		wg.Add(1)
+		go func(ch <-chan pipeline.DispatchMessage) {
+			defer wg.Done()
+			d.serve(ch)
+		}(ch)
+	}
+	d.flow.Start(ctx)
+	<-ctx.Done()
+	d.flow.StopConsuming()
+	wg.Wait()
+	d.flow.Shutdown()
+}
+
+func (d *Dispatcher) serve(ch <-chan pipeline.DispatchMessage) {
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+	for msg := range ch {
+		inflight.Add(1)
+		go func(msg pipeline.DispatchMessage) {
+			defer inflight.Done()
+			defer pipeline.ReleaseAll(msg.Releases)
+			if msg.Request == nil {
+				return
+			}
+			d.process(unitFromRequest(msg.Request), msg.Owner)
+		}(msg)
 	}
 }
 
@@ -115,9 +156,15 @@ func (d *Dispatcher) tick(ctx context.Context) {
 }
 
 func (d *Dispatcher) expireReady(ctx context.Context, now time.Time) {
-	for _, tier := range []model.Tier{model.TierNearline, model.TierBatch} {
+	for _, tier := range []model.Tier{model.TierInteractive, model.TierAsync, model.TierBatch} {
 		if _, err := d.store.ExpireReady(ctx, tier, now); err != nil {
 			d.log.Error("expire ready", "tier", tier, "err", err)
+		}
+	}
+	if d.opts.Observer != nil && d.opts.Observer.Metrics != nil {
+		budget := d.gate.Budget(ctx)
+		for _, tier := range []string{"interactive", "async", "batch"} {
+			d.opts.Observer.Metrics.SetBudget(d.pool, tier, "local", budget)
 		}
 	}
 }
@@ -152,126 +199,74 @@ func (d *Dispatcher) drainExpired(ctx context.Context) {
 }
 
 func (d *Dispatcher) pump(ctx context.Context) {
+	channels := append([]pipeline.RequestChannel(nil), d.flow.sources...)
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		order, err := d.candidateTiers(ctx)
-		if err != nil {
-			d.log.Error("candidate tiers", "err", err)
+		ch, req, ok := d.flow.merge.Next(ctx, channels)
+		if !ok || req == nil {
 			return
 		}
-		if len(order) == 0 {
-			return
-		}
-		var (
-			tier    model.Tier
-			release func()
-			granted bool
-		)
-		for _, candidate := range order {
-			rel, ok := d.budget.Allow(ctx, candidate)
-			if !ok {
-				continue
-			}
-			tier = candidate
-			release = rel
-			granted = true
-			break
-		}
-		if !granted {
-			return
-		}
+		tier := model.Tier(req.Message.Tier)
 		owner, err := id.New("own_")
 		if err != nil {
-			release()
 			d.log.Error("owner id", "err", err)
 			return
 		}
+		admitCtx := pipeline.WithAdmission(ctx, owner)
+		var releases []pipeline.ReleaseFunc
+		verdict, err := pipeline.ApplyChain(admitCtx, req, []pipeline.Gate{ch.Gate}, &releases)
+		if err != nil {
+			pipeline.ReleaseAll(releases)
+			d.log.Error("gate", "tier", tier, "err", err)
+			return
+		}
+		if verdict != pipeline.VerdictContinue {
+			pipeline.ReleaseAll(releases)
+			channels = withoutTier(channels, req.Message.Tier)
+			continue
+		}
+		traceParent := ""
+		if req.Message.Metadata != nil {
+			traceParent = req.Message.Metadata[pipeline.MetaTraceparent]
+		}
+		_, claimSpan := d.startSpan(context.Background(), traceParent, "dispatch.claim")
 		unit, err := d.store.Claim(ctx, tier, d.clk.Now().Add(d.opts.LeaseTTL), owner)
+		claimSpan.End()
 		if err != nil || unit == nil {
-			release()
+			pipeline.ReleaseAll(releases)
 			if err != nil {
-				d.log.Error("claim", "tier", tier, "err", err)
+				d.log.Error("claim", "tier", tier, "pool", d.pool, "owner", owner, "err", err)
 			}
 			return
 		}
-		d.note(tier)
-		d.wg.Add(1)
-		go func(u *model.Unit, owner string, release func()) {
-			defer d.wg.Done()
-			defer release()
-			d.process(u, owner)
-		}(unit, owner, release)
+		if unit.TraceParent == "" {
+			unit.TraceParent = traceParent
+		}
+		if d.opts.Observer != nil && d.opts.Observer.Metrics != nil {
+			d.opts.Observer.Metrics.ObserveClaim(d.pool, string(unit.Tier), unit.Created, unit.Deadline, d.clk.Now())
+		}
+		claimed := store.PipelineRequest(unit, d.store.QueueKey(unit.Tier))
+		msg := pipeline.DispatchMessage{Request: &claimed, Owner: owner, Releases: releases}
+		select {
+		case <-ctx.Done():
+			pipeline.ReleaseAll(releases)
+			return
+		case ch.Channel <- msg:
+			d.flow.merge.Note(unit.Tier)
+		}
 	}
 }
 
-// candidateTiers returns the preferred tier, then the other tier when it also
-// has ready work. A budget refusal for the first tier must not skip the second.
-func (d *Dispatcher) candidateTiers(ctx context.Context) ([]model.Tier, error) {
-	preferred, ok := d.choose(ctx)
-	if !ok {
-		return nil, nil
+func (d *Dispatcher) startSpan(ctx context.Context, traceparent, name string) (context.Context, *observe.Span) {
+	if d.opts.Observer == nil {
+		return ctx, nil
 	}
-	order := []model.Tier{preferred}
-	other := model.TierBatch
-	if preferred == model.TierBatch {
-		other = model.TierNearline
+	if traceparent != "" {
+		ctx = observe.WithTraceparent(ctx, traceparent)
 	}
-	n, err := d.store.QueueLen(ctx, other)
-	if err != nil {
-		return nil, err
-	}
-	if n > 0 {
-		order = append(order, other)
-	}
-	return order, nil
-}
-
-func (d *Dispatcher) choose(ctx context.Context) (model.Tier, bool) {
-	nl, err := d.store.QueueLen(ctx, model.TierNearline)
-	if err != nil {
-		d.log.Error("queue len", "err", err)
-		return "", false
-	}
-	bl, err := d.store.QueueLen(ctx, model.TierBatch)
-	if err != nil {
-		d.log.Error("queue len", "err", err)
-		return "", false
-	}
-	nld, _, err := d.store.EarliestDeadline(ctx, model.TierNearline)
-	if err != nil {
-		d.log.Error("earliest deadline", "err", err)
-		return "", false
-	}
-	bd, _, err := d.store.EarliestDeadline(ctx, model.TierBatch)
-	if err != nil {
-		d.log.Error("earliest deadline", "err", err)
-		return "", false
-	}
-	d.mu.Lock()
-	consec := d.consec
-	d.mu.Unlock()
-	return schedule.Pick(schedule.Input{
-		NearlineReady:       int(nl),
-		BatchReady:          int(bl),
-		NearlineDeadline:    nld,
-		BatchDeadline:       bd,
-		ConsecutiveNearline: consec,
-		ReserveEvery:        d.opts.ReserveEvery,
-		Now:                 d.clk.Now(),
-		AgingSlack:          d.opts.AgingSlack,
-	})
-}
-
-func (d *Dispatcher) note(tier model.Tier) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if tier == model.TierNearline {
-		d.consec++
-		return
-	}
-	d.consec = 0
+	return d.opts.Observer.Start(ctx, name)
 }
 
 func (d *Dispatcher) process(u *model.Unit, owner string) {
@@ -295,13 +290,13 @@ func (d *Dispatcher) process(u *model.Unit, owner string) {
 		}
 		return
 	}
-	if d.clk.Now().UnixMilli() >= u.Deadline {
+	if d.clk.Now().Unix() >= u.Deadline {
 		if err := d.finishExpired(ctx, u, owner); err != nil {
 			d.log.Error("finish expired", "id", u.ID, "err", err)
 		}
 		return
 	}
-	if u.Tier == model.TierNearline {
+	if u.Tier == model.TierAsync {
 		if err := d.store.SetNearlineStatus(ctx, u.ID, model.StatusInProgress, 0); err != nil {
 			d.log.Error("mark in progress", "id", u.ID, "err", err)
 		}
@@ -314,7 +309,7 @@ func (d *Dispatcher) process(u *model.Unit, owner string) {
 	}
 
 	timeout := d.opts.RequestTimeout
-	remain := time.UnixMilli(u.Deadline).Sub(d.clk.Now())
+	remain := time.Unix(u.Deadline, 0).Sub(d.clk.Now())
 	if remain < timeout {
 		timeout = remain
 	}
@@ -330,9 +325,19 @@ func (d *Dispatcher) process(u *model.Unit, owner string) {
 	stopWatch := d.watch(reqCtx, cancel, u, owner)
 	defer stopWatch()
 
-	resp, callErr := d.up.Do(reqCtx, u)
+	upCtx, upSpan := d.startSpan(reqCtx, u.TraceParent, "dispatch.upstream")
+	started := d.clk.Now()
+	resp, callErr := d.up.Do(upCtx, u)
+	upSpan.End()
+	if d.opts.Observer != nil && d.opts.Observer.Metrics != nil {
+		code := 0
+		if resp != nil {
+			code = resp.StatusCode
+		}
+		d.opts.Observer.Metrics.ObserveUpstream(d.pool, string(u.Tier), code, d.clk.Now().Sub(started))
+	}
 	if callErr != nil && errors.Is(callErr, context.Canceled) {
-		lost, lerr := d.leaseLost(ctx, u.ID, owner)
+		lost, lerr := d.leaseLost(ctx, u.ID, u.Token, owner)
 		if lerr != nil {
 			d.log.Error("lease check", "id", u.ID, "err", lerr)
 			return
@@ -391,7 +396,7 @@ func (d *Dispatcher) process(u *model.Unit, owner string) {
 		}
 		return
 	}
-	remain = time.UnixMilli(u.Deadline).Sub(d.clk.Now())
+	remain = time.Unix(u.Deadline, 0).Sub(d.clk.Now())
 	delay, ok := retry.NextDelay(u.Attempts, d.opts.RetryBase, d.opts.RetryMax, retryAfter, remain)
 	if !ok {
 		if err := d.finishExpired(ctx, u, owner); err != nil {
@@ -399,11 +404,10 @@ func (d *Dispatcher) process(u *model.Unit, owner string) {
 		}
 		return
 	}
-	if err := d.store.ParkRetry(ctx, u, owner, d.clk.Now().Add(delay)); err != nil {
-		d.log.Error("park retry", "id", u.ID, "err", err)
-		return
-	}
-	d.log.Info("retry scheduled", "id", u.ID, "attempt", u.Attempts, "delay", delay.String(), "status", status)
+	req := store.PipelineRequest(u, d.store.QueueKey(u.Tier))
+	d.flow.RetryChannel() <- pipeline.RetryMessage{Request: &req, Owner: owner, Backoff: delay}
+	d.countAttempt(u, "retry")
+	d.log.Info("retry scheduled", "id", u.ID, "pool", d.pool, "owner", owner, "attempt", u.Attempts, "delay", delay.String(), "status", status)
 }
 
 func (d *Dispatcher) watch(reqCtx context.Context, cancel context.CancelFunc, u *model.Unit, owner string) func() {
@@ -422,7 +426,13 @@ func (d *Dispatcher) watch(reqCtx context.Context, cancel context.CancelFunc, u 
 			case <-reqCtx.Done():
 				return
 			case <-ticker.C:
-				ok, err := d.store.ExtendLease(context.Background(), u.ID, owner, d.clk.Now().Add(d.opts.LeaseTTL))
+				until := d.clk.Now().Add(d.opts.LeaseTTL)
+				ok, err := d.store.ExtendLease(context.Background(), u.ID, u.Token, owner, until)
+				if err == nil && ok {
+					if _, serr := d.store.ExtendSlot(context.Background(), u.Tier, owner, until); serr != nil {
+						d.log.Warn("extend inflight slot", "id", u.ID, "owner", owner, "err", serr)
+					}
+				}
 				if err != nil || !ok {
 					cancel()
 					return
@@ -438,8 +448,8 @@ func (d *Dispatcher) watch(reqCtx context.Context, cancel context.CancelFunc, u 
 	return stop
 }
 
-func (d *Dispatcher) leaseLost(ctx context.Context, id, owner string) (bool, error) {
-	ok, err := d.store.ExtendLease(ctx, id, owner, d.clk.Now().Add(d.opts.LeaseTTL))
+func (d *Dispatcher) leaseLost(ctx context.Context, id, token, owner string) (bool, error) {
+	ok, err := d.store.ExtendLease(ctx, id, token, owner, d.clk.Now().Add(d.opts.LeaseTTL))
 	if err != nil {
 		return false, err
 	}
@@ -527,15 +537,58 @@ func (d *Dispatcher) finish(ctx context.Context, u *model.Unit, owner string, re
 	if u.BatchID != "" {
 		line = outputLine(u, res)
 	}
+	_, ackSpan := d.startSpan(context.Background(), u.TraceParent, "dispatch.ack")
 	created, err := d.store.Finish(ctx, u, owner, res, line, countField, true, d.opts.ResultTTL)
+	ackSpan.End()
 	if err != nil {
 		return err
 	}
-	if created && u.Tier == model.TierNearline {
+	if created && u.Tier == model.TierAsync {
 		if err := d.store.SetNearlineStatus(ctx, u.ID, res.Status, res.FinishedAt); err != nil {
 			return err
 		}
 	}
-	d.log.Info("request finished", "id", u.ID, "tier", u.Tier, "status", res.Status, "attempts", res.Attempts, "created", created)
+	if created {
+		d.countAttempt(u, attemptResult(res.Status))
+		d.observeTokens(u, res)
+		d.flow.ResultChannel() <- pipeline.Result{
+			ID:           u.ID,
+			RequestToken: u.Token,
+			StatusCode:   res.StatusCode,
+			Payload:      append([]byte(nil), res.Body...),
+			ErrorCode:    res.ErrorCode,
+			ErrorMessage: res.ErrorMessage,
+		}
+	}
+	d.log.Info("request finished", "id", u.ID, "tier", u.Tier, "pool", d.pool, "owner", owner, "status", res.Status, "attempts", res.Attempts, "created", created)
 	return nil
+}
+
+func (d *Dispatcher) countAttempt(u *model.Unit, result string) {
+	if d.opts.Observer == nil || d.opts.Observer.Metrics == nil || u == nil {
+		return
+	}
+	d.opts.Observer.Metrics.Attempt(d.pool, string(u.Tier), result)
+}
+
+func attemptResult(status string) string {
+	switch status {
+	case model.StatusCompleted:
+		return "ok"
+	case model.StatusExpired:
+		return "expired"
+	case model.StatusCancelled:
+		return "cancelled"
+	default:
+		return "failed"
+	}
+}
+
+func (d *Dispatcher) observeTokens(u *model.Unit, res *model.Result) {
+	if d.opts.Observer == nil || d.opts.Observer.Metrics == nil || res == nil || res.Status != model.StatusCompleted {
+		return
+	}
+	in, out := usageTokens(res.Body)
+	d.opts.Observer.Metrics.Tokens(d.pool, string(u.Tier), "input", in)
+	d.opts.Observer.Metrics.Tokens(d.pool, string(u.Tier), "output", out)
 }
