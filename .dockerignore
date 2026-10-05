@@ -1,0 +1,4 @@
+bin
+.git
+coverage.out
+*.md

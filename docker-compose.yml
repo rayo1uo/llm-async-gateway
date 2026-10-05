@@ -1,0 +1,41 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  mockupstream:
+    build: .
+    command: ["mockupstream", "-addr", ":8090", "-delay", "30ms"]
+    ports:
+      - "8090:8090"
+
+  gateway:
+    build: .
+    environment:
+      GATEWAY_ADDR: ":8080"
+      REDIS_ADDR: redis:6379
+      UPSTREAM_URL: http://mockupstream:8090
+      LOG_LEVEL: info
+      POLL_INTERVAL: 50ms
+      MAX_CONCURRENCY: "8"
+      RESERVED_BATCH_SLOTS: "2"
+      BATCH_ENQUEUE_WINDOW: "16"
+      BATCH_RESERVE_EVERY: "5"
+      AGING_SLACK: 2m
+      DEFAULT_COMPLETION_WINDOW: 24h
+      DEFAULT_NEARLINE_DEADLINE: 2m
+      LEASE_TTL: 30s
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mockupstream:
+        condition: service_started
