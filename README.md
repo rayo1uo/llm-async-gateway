@@ -7,6 +7,8 @@
 
 调度思路对齐 [llm-d-async](https://github.com/llm-d/llm-d-async) 和 [llm-d-batch-gateway](https://github.com/llm-d/llm-d-batch-gateway)：Redis 有序集合按 deadline 做 EDF，claim/lease/ack 保证至少投递一次，派发前经过可替换的 budget。本仓库是可运行的第一版，不是生产级多租户系统。设计背景见仓库讨论中的调研笔记；下面描述的是**这份代码实际做成的样子**。
 
+从 demo 演进到生产的架构决策见 [RFC 0001](docs/rfcs/0001-production-architecture.md)。RFC 把这条入口称为 async；获批前，代码行为以本文为准。
+
 ## 架构
 
 API、批作业控制器和 dispatcher 跑在同一个 `gateway` 进程里，方便演示。它们只通过 Redis 协作，拆成多个副本时可以共用同一套键。
