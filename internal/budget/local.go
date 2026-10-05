@@ -1,7 +1,7 @@
-// Package budget admits dispatch slots. Local is a concurrency and rate limiter.
-// A later Prometheus implementation can satisfy the same method set and compute
-// N = maxSYS * (D - baseline) from EPP or vLLM saturation, matching llm-d-async's
-// dispatch budget, without changing the dispatcher.
+// Package budget admits dispatch slots.
+// Local is the in-process half of the Phase 1 gate: a concurrency cap, a rate
+// bucket, and slots held back for batch. SharedGate adds the Redis counter so
+// replicas cannot multiply the cap.
 package budget
 
 import (
@@ -15,8 +15,8 @@ import (
 // LocalConfig parameterizes Local.
 type LocalConfig struct {
 	MaxConcurrency int
-	// ReservedBatch is the number of concurrency slots nearline is not allowed
-	// to occupy, so a busy nearline lane cannot consume the whole pool.
+	// ReservedBatch is the number of concurrency slots async and interactive
+	// are not allowed to occupy, so a busy higher lane cannot consume the pool.
 	ReservedBatch int
 	RatePerSec    float64
 	Burst         int
@@ -35,7 +35,7 @@ type Local struct {
 	tokens        float64
 	last          time.Time
 	inFlight      int
-	nearlineInUse int
+	nonBatchInUse int
 	batchInUse    int
 }
 
@@ -73,15 +73,15 @@ func (b *Local) Allow(ctx context.Context, tier model.Tier) (release func(), ok 
 	if b.tokens < 1 || b.inFlight >= b.max {
 		return nil, false
 	}
-	if tier == model.TierNearline && b.nearlineInUse >= b.max-b.reserved {
+	if tier != model.TierBatch && b.nonBatchInUse >= b.max-b.reserved {
 		return nil, false
 	}
 	b.tokens--
 	b.inFlight++
-	if tier == model.TierNearline {
-		b.nearlineInUse++
-	} else {
+	if tier == model.TierBatch {
 		b.batchInUse++
+	} else {
+		b.nonBatchInUse++
 	}
 	var once sync.Once
 	return func() {
@@ -91,15 +91,22 @@ func (b *Local) Allow(ctx context.Context, tier model.Tier) (release func(), ok 
 			if b.inFlight > 0 {
 				b.inFlight--
 			}
-			if tier == model.TierNearline {
-				if b.nearlineInUse > 0 {
-					b.nearlineInUse--
+			if tier == model.TierBatch {
+				if b.batchInUse > 0 {
+					b.batchInUse--
 				}
-			} else if b.batchInUse > 0 {
-				b.batchInUse--
+			} else if b.nonBatchInUse > 0 {
+				b.nonBatchInUse--
 			}
 		})
 	}, true
+}
+
+// Snapshot reports the in-process in-flight count and the configured cap.
+func (b *Local) Snapshot() (inFlight, max int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inFlight, b.max
 }
 
 func (b *Local) refill() {

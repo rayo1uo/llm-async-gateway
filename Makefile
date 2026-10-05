@@ -3,6 +3,9 @@
 build:
 	mkdir -p bin
 	go build -o bin/gateway ./cmd/gateway
+	go build -o bin/gateway-api ./cmd/gateway-api
+	go build -o bin/batch-controller ./cmd/batch-controller
+	go build -o bin/dispatcher ./cmd/dispatcher
 	go build -o bin/mockupstream ./cmd/mockupstream
 
 test:

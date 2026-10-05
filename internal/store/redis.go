@@ -18,15 +18,28 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // Store is a Redis-backed repository. It is safe for concurrent use.
+// Queue keys carry a pool hash tag, for example lag:{default}:q:async.
 type Store struct {
 	rdb    *redis.Client
 	prefix string
+	pool   string
 }
 
-// New returns a store that prefixes every key.
+// New returns a store for the default pool.
 func New(rdb *redis.Client, prefix string) *Store {
-	return &Store{rdb: rdb, prefix: prefix}
+	return NewInPool(rdb, prefix, "default")
 }
+
+// NewInPool returns a store whose hot keys share the {pool} hash tag.
+func NewInPool(rdb *redis.Client, prefix, pool string) *Store {
+	if pool == "" {
+		pool = "default"
+	}
+	return &Store{rdb: rdb, prefix: prefix, pool: pool}
+}
+
+// Pool is the inference-pool name embedded in the hash tag.
+func (s *Store) Pool() string { return s.pool }
 
 // Ping checks the Redis connection.
 func (s *Store) Ping(ctx context.Context) error {
@@ -37,7 +50,7 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 func (s *Store) key(parts ...string) string {
-	return s.prefix + ":" + strings.Join(parts, ":")
+	return s.prefix + ":{" + s.pool + "}:" + strings.Join(parts, ":")
 }
 
 func (s *Store) setJSON(ctx context.Context, key string, v any) error {

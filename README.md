@@ -1,30 +1,42 @@
 # llm-async-gateway
 
-一个用 Go 和 Redis 实现的异步推理网关演示。它把两种入口接到同一条带截止时间的队列上：
+一个用 Go 和 Redis 实现的异步推理网关。它把两种入口接到同一条带截止时间的队列上：
 
 1. **Batch**：兼容 OpenAI Batch API 的文件进、文件出作业。
-2. **Nearline**：单次 OpenAI 风格请求异步提交，立刻返回 id，再轮询或取消。
+2. **Async**：单次 OpenAI 风格请求异步提交（`POST /v1/requests`），立刻返回 id，再轮询或取消。队列里的 tier 字符串是 `async`。
 
-调度思路对齐 [llm-d-async](https://github.com/llm-d/llm-d-async) 和 [llm-d-batch-gateway](https://github.com/llm-d/llm-d-batch-gateway)：Redis 有序集合按 deadline 做 EDF，claim/lease/ack 保证至少投递一次，派发前经过可替换的 budget。本仓库是可运行的第一版，不是生产级多租户系统。设计背景见仓库讨论中的调研笔记；下面描述的是**这份代码实际做成的样子**。
-
-从 demo 演进到生产的架构决策见 [RFC 0001](docs/rfcs/0001-production-architecture.md)。RFC 把这条入口称为 async；获批前，代码行为以本文为准。
+调度按 deadline 做 EDF，claim/lease/ack 保证至少投递一次，派发前经过 `pipeline.Gate`。类型在本仓库实现，不依赖 llm-d 模块。生产架构见 [RFC 0001](docs/rfcs/0001-production-architecture.md)。当前代码是该 RFC 的 Phase 1：三个进程、共享 in-flight、controller 选主，以及不依赖 MySQL 的指标。文件和作业记录仍在 Redis。指标和 PromQL 见 [docs/observability.md](docs/observability.md)。
 
 ## 架构
 
-API、批作业控制器和 dispatcher 跑在同一个 `gateway` 进程里，方便演示。它们只通过 Redis 协作，拆成多个副本时可以共用同一套键。
+三个二进制只通过 Redis 协作：
+
+| 二进制 | 角色 |
+|---|---|
+| `gateway-api` | HTTP API。不跑 reconcile，也不派发 |
+| `batch-controller` | 用 Redis 锁和 fencing token 选主。只有 leader 校验并补货 |
+| `dispatcher` | 按 `pipeline.Flow` 领队列并调用上游 |
+
+`cmd/gateway` 把三个角色装进同一个进程，`make demo` 仍然用它。`docker compose up` 启动 2 个 API、2 个 dispatcher、1 个 controller 和 1 个 standby。API 副本不会推进 batch。
 
 ```mermaid
 flowchart LR
   subgraph clients [Clients]
     BC[Batch client]
-    NC[Nearline client]
+    NC[Async client]
   end
 
-  subgraph proc [gateway process]
+  subgraph api [gateway-api]
     API[HTTP API]
-    CTL[Batch controller]
-    DISP[Dispatcher]
-    BUD[Budget limiter]
+  end
+
+  subgraph ctl [batch-controller]
+    CTL[Leader only]
+  end
+
+  subgraph disp [dispatcher]
+    DISP[Flow]
+    GATE[local plus Redis inflight]
   end
 
   REDIS[(Redis)]
@@ -35,7 +47,7 @@ flowchart LR
   API --> REDIS
   CTL -->|validate and windowed enqueue| REDIS
   DISP -->|claim by tier then EDF| REDIS
-  DISP --> BUD
+  DISP --> GATE
   DISP -->|POST chat completions and friends| UP
   DISP -->|results| REDIS
   CTL -->|output and error JSONL| REDIS
@@ -56,7 +68,7 @@ sequenceDiagram
   A->>R: ZADD tier queue score=deadline
   A-->>C: id, status=queued or validating
   loop until deadline
-    D->>D: budget Allow(tier)
+    D->>D: pipeline.Gate Apply
     D->>R: claim earliest deadline, lease TTL
     D->>U: HTTP
     alt 2xx
@@ -72,39 +84,41 @@ sequenceDiagram
 
 ### 队列
 
-两个就绪队列，都是 Redis sorted set，score 是 deadline 的 Unix 毫秒，越小越先出队：
+就绪队列是 Redis sorted set。score 和消息里的 deadline 都是 Unix **秒**，越小越先出队。键带 hash tag，同一个 pool 落在同一个 slot。默认 pool 是 `default`，前缀是 `lag`：
 
 | 通道 | 键 | 谁写入 |
 |---|---|---|
-| nearline | `{prefix}:q:nearline` | `POST /v1/requests` |
-| batch | `{prefix}:q:batch` | 批控制器按窗口补货 |
+| interactive | `lag:{default}:q:interactive` | 预留。Phase 1 没有单独的 HTTP 入口 |
+| async | `lag:{default}:q:async` | `POST /v1/requests` |
+| batch | `lag:{default}:q:batch` | 批控制器按窗口补货 |
 
-另外还有：
+另外还有（都在 `lag:{default}:` 下）：
 
-- `{prefix}:claimed`：已租出的请求，score 是租约到期时间。member 是 `id|owner`，owner 每次 claim 新生成，避免崩溃后的旧 worker 误 ack。
-- `{prefix}:retry`：可重试失败在这里等到退避结束，再按**原来的 deadline** 回到就绪队列，不插队。
-- `{prefix}:expired`：租约或退避期间已经过了 deadline 的 id，由 dispatcher 写成终态。
+- `claimed`：已租出的请求。score 是租约到期的 Unix **毫秒**，这样亚秒级租约仍然有效。member 是 `id|request_token|owner`。token 在入队、回收、重试提升时递增。Finish 先检查这个 member 还在，过期 owner 不能写结果。
+- `retry`：可重试失败在这里等到退避结束，再按**原来的 deadline** 回到就绪队列，不插队。score 同样是毫秒。
+- `expired`：租约或退避期间已经过了 deadline 的 id，由 dispatcher 写成终态。
+- `finished`：已经写出终态的 id。回收和提升用这个集合，不再在 Lua 里拼接结果键。
+- `slots`：共享 in-flight。field 是 `tier|owner`，value 是到期毫秒。
 
-出队是 peek + claim + ack，不是 `ZPOPMIN`。租约默认 30s，每 `lease/3` 续期。dispatcher 崩溃后，过期租约会被重新入队，所以投递是 **at-least-once**。结果用 `SET NX` 只记第一次，批次数不会因为重复执行加两次。
+出队是 peek + claim + ack，不是 `ZPOPMIN`。租约默认 30s，每 `lease/3` 续期。dispatcher 崩溃后，过期租约会被重新入队，所以投递是 **at-least-once**。结果用 `SET NX` 只记第一次。批次数用 `HSETNX`，同一 `custom_id` 只计一次。回收和提升脚本的键全部走 `KEYS`。
 
 ### 优先级和防饥饿
 
-Nearline 默认优先于 batch。两个例外：
+`interactive` 严格最高，除非更低通道已经进入 `AGING_SLACK` 并且 deadline 更早。async 默认优先于 batch。两个例外：
 
-1. **老化**：batch 队头的 deadline 已经落在 `AGING_SLACK` 内，并且比 nearline 队头更早，就先处理 batch。
-2. **轮转份额**：连续派发 `BATCH_RESERVE_EVERY` 个 nearline 之后，如果 batch 队列非空，下一个名额给 batch。
+1. **老化**：batch 队头的 deadline 已经落在 `AGING_SLACK` 内，并且比 async 队头更早，就先处理 batch。
+2. **轮转份额**：连续派发 `BATCH_RESERVE_EVERY` 个 async 之后，如果 batch 队列非空，下一个名额给 batch。
 
-并发闸门再留出 `RESERVED_BATCH_SLOTS` 个 in-flight 槽位，nearline 占用不到。这样高峰时 batch 不会因为 nearline 把并发打满而完全停住。
+闸门拒绝一条通道时，同一次轮询会改试另一条，不会因为 async 满了就跳过 batch。
 
-### Budget
+### Gate
 
-`dispatch.Budget` 只有一个方法：
+Dispatcher 按 `pipeline.Flow` 装配。Phase 1 的 gate 实现是 `budget.SharedGate`（`gate_type=local`）：
 
-```go
-Allow(ctx context.Context, tier model.Tier) (release func(), ok bool)
-```
+- 进程内：令牌桶，加上 `RESERVED_BATCH_SLOTS`。async 和 interactive 用不了留给 batch 的槽位。
+- 进程间：Redis `slots` 计数。两个 dispatcher 同时跑时，全局 in-flight 不超过 `MAX_CONCURRENCY`。持有者带到期时间，崩溃后容量会自己回来。
 
-现在的实现是 `budget.Local`：全局令牌桶（速率）加上有上限的 in-flight，并遵守上面的预留槽位。以后可以换成 Prometheus 饱和度预算，例如 llm-d-async 的 `N = maxSYS * (D - baseline)`，dispatcher 不用改。
+`GATES` 里出现未知名字，或者列表为空，进程拒绝开放派发。Prometheus 饱和度 gate 不在 Phase 1。
 
 ### 批作业
 
@@ -121,24 +135,29 @@ Allow(ctx context.Context, tier model.Tier) (release func(), ok bool)
 ## 包布局
 
 ```
-cmd/gateway          API + 控制器 + dispatcher
-cmd/mockupstream     无 GPU 的 OpenAI 兼容上游
-internal/api         /v1/files、/v1/batches、/v1/requests
-internal/app         进程装配
-internal/batch       校验、窗口入队、结果文件、状态机
-internal/budget      并发/速率闸门（Budget 的一种实现）
-internal/config      环境变量和 flags
-internal/dispatch    租约、重试、上游 HTTP
-internal/jsonl       Batch JSONL 解析
-internal/model       对外 JSON 文档
-internal/retry       退避和 Retry-After
-internal/schedule    nearline / batch 选择
-internal/store       Redis 存储和 Lua 脚本
+cmd/gateway            三合一，供 make demo
+cmd/gateway-api        只提供 HTTP
+cmd/batch-controller   选主并 reconcile
+cmd/dispatcher         领队列并调用上游
+cmd/mockupstream       无 GPU 的 OpenAI 兼容上游
+internal/api           /v1/files、/v1/batches、/v1/requests
+internal/app           按角色装配进程
+internal/batch         校验、窗口入队、结果文件、状态机
+internal/budget        本地并发/速率，加上 Redis 共享 in-flight
+internal/config        环境变量和 flags
+internal/dispatch      租约、重试、上游 HTTP、Flow
+internal/jsonl         Batch JSONL 解析
+internal/model         对外 JSON 文档
+internal/observe       /metrics 与 traceparent
+internal/pipeline      Message、Request、Result、Gate、Flow
+internal/retry         退避和 Retry-After
+internal/schedule      interactive / async / batch 选择
+internal/store         Redis 存储和 Lua 脚本
 ```
 
-接口放在使用方：`dispatch.Budget` 和 `dispatch.Upstream`。存储是具体的 Redis 类型，测试用 miniredis，不另做一套假存储。
+上游接口是 `dispatch.Upstream`。存储是具体的 Redis 类型，测试用 miniredis，不另做一套假存储。
 
-## Nearline API
+## Async API
 
 形态接近 OpenAI Responses 的 `background: true`（提交后拿 id，再轮询和取消），也接近 llm-d coordinator 的 `X-AP-Mode: enqueue`。没有复用 `/v1/responses` 的完整 schema，避免把同步 Responses 语义和异步作业缠在一起。
 
@@ -156,7 +175,7 @@ internal/store       Redis 存储和 Lua 脚本
 }
 ```
 
-`endpoint` 可省略，默认 `/v1/chat/completions`。还支持 `/v1/completions`、`/v1/embeddings`、`/v1/responses`。`deadline_seconds` 可省略，默认 `DEFAULT_NEARLINE_DEADLINE`（5 分钟），范围 1 到 86400。`Idempotency-Key` 会返回同一个请求。
+`endpoint` 可省略，默认 `/v1/chat/completions`。还支持 `/v1/completions`、`/v1/embeddings`、`/v1/responses`。`deadline_seconds` 可省略，默认 `DEFAULT_NEARLINE_DEADLINE`（5 分钟），范围 1 到 86400。对外 JSON 里的 deadline 仍是 Unix 秒。`Idempotency-Key` 会返回同一个请求。客户端的 `metadata` 原样返回，trace 不写进这个对象。
 
 `GET /v1/requests/{id}` 返回同一份对象。`status` 为 `queued`、`in_progress`、`cancelling`、`completed`、`failed`、`expired`、`cancelled`。完成后 `response` 里是上游的 status code 和 body；失败时 `error.code` 类似 `deadline_exceeded`、`cancelled`、`upstream_error`、`max_attempts_exceeded`。
 
@@ -168,7 +187,10 @@ internal/store       Redis 存储和 Lua 脚本
 
 ```bash
 docker compose up --build
-# 网关 http://127.0.0.1:8080 ，mock http://127.0.0.1:8090
+# API http://127.0.0.1:8080 和 :8081
+# dispatcher 指标 :8082 和 :8083
+# controller /leaderz :8084 和 :8085
+# mock http://127.0.0.1:8090
 ```
 
 或者不用 Docker：
@@ -177,9 +199,9 @@ docker compose up --build
 make demo
 ```
 
-`scripts/demo.sh` 会拉起本机 Redis、mock 和 gateway，提交一条 nearline 和一份 batch，并打印结果。
+`scripts/demo.sh` 会拉起本机 Redis、mock 和三合一 `gateway`，提交一条 async 请求和一份 batch，并检查 `/metrics`。
 
-### Nearline
+### Async
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/v1/requests \
@@ -221,7 +243,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/batches/batch_.../cancel
 curl -s http://127.0.0.1:8080/v1/files/file_.../content
 ```
 
-健康检查：`GET /healthz`，`GET /readyz`（会 ping Redis）。
+健康检查：`GET /healthz`，`GET /readyz`（会 ping Redis）。指标：`GET /metrics`。Controller：`GET /leaderz`。
 
 ## 配置
 
@@ -234,6 +256,7 @@ curl -s http://127.0.0.1:8080/v1/files/file_.../content
 | `REDIS_PASSWORD` | `-redis-password` | 空 | 密码 |
 | `REDIS_DB` | `-redis-db` | `0` | DB |
 | `KEY_PREFIX` | `-key-prefix` | `lag` | 键前缀 |
+| `POOL` | `-pool` | `default` | Redis hash tag 里的 pool |
 | `UPSTREAM_URL` | `-upstream-url` | `http://127.0.0.1:8090` | 推理上游 |
 | `MAX_CONCURRENCY` | `-max-concurrency` | `8` | 最大 in-flight |
 | `RESERVED_BATCH_SLOTS` | `-reserved-batch-slots` | `1` | 留给 batch 的槽位 |
@@ -253,6 +276,8 @@ curl -s http://127.0.0.1:8080/v1/files/file_.../content
 | `RETRY_MAX` | `-retry-max` | `30s` | 退避上限 |
 | `MAX_ATTEMPTS` | `-max-attempts` | `8` | 单请求尝试次数 |
 | `LOG_LEVEL` | `-log-level` | `info` | `debug` `info` `warn` `error` |
+| `CONTROLLER_LOCK_TTL` | `-controller-lock-ttl` | `10s` | controller 选主租约 |
+| `GATES` | `-gates` | `local` | 逗号分隔。Phase 1 只接受 `local` |
 
 重试对 408、429 和 5xx 以及网络错误生效。`Retry-After`（秒或 HTTP 日期）优先于指数退避，并且会被压到剩余 deadline 的一半以内。没有 `Retry-After` 时使用等量抖动。400 一类错误不重试。次数或时间耗尽后写入终态。
 
@@ -276,10 +301,10 @@ make demo
 
 ## 设计取舍
 
-- **一个执行面，两个入口。** 批作业和近线请求都变成带 `tier` 和 `deadline` 的 unit。API 分开，是为了贴住 OpenAI 的产品划分；队列共用，是为了让截止时间能跨入口比较。
-- **Nearline 严格优先，再用老化和预留槽位保 batch。** 纯严格优先级会把 batch 饿到过期。纯 EDF 又会让一个快到期的大 batch 堵住交互式近线。现在的规则是：nearline 更早或一样早时 nearline 仍赢；只有 batch 更紧迫且已经进入 slack，才插到 nearline 前面。轮转和预留槽位保证即使 deadline 还早，batch 也有最低吞吐量。
+- **一个执行面，两个入口。** 批作业和 async 请求都变成 `pipeline.Request`。HTTP 路径仍按 OpenAI 的产品划分；队列共用，是为了让截止时间能跨入口比较。
+- **Async 默认优先，再用老化和预留槽位保 batch。** 纯严格优先级会把 batch 饿到过期。纯 EDF 又会让一个快到期的大 batch 堵住交互式请求。现在的规则是：async 更早或一样早时 async 仍赢；只有 batch 更紧迫且已经进入 slack，才插到 async 前面。轮转和预留槽位保证即使 deadline 还早，batch 也有最低吞吐量。
 - **窗口入队，而不是整文件一次 ZADD。** 大 batch 不会把全部 body 堆进就绪队列。代价是跨作业的 EDF 只在「已经入队的那一窗」里精确，更早的作业靠控制器按 deadline 排序优先补货来近似。
-- **主动限流用本地并发和速率，而不是 Prometheus。** 演示没有 EPP / vLLM 指标。接口留成 `Budget`，避免以后接饱和度时改派发循环。本地预留槽位是「每层不同 baseline」的简化版。
+- **主动限流用本地并发加上 Redis 共享 in-flight。** 接口是 `pipeline.Gate`。Prometheus 饱和度预算留到后面的阶段，dispatcher 循环不用改。本地预留槽位是「每层不同 baseline」的简化版。
 - **至少一次，而不是正好一次。** 租约能把崩溃 worker 的请求找回来，也可能把同一次推理打两次。结果写入是幂等的；GPU 时间不是。这和 llm-d-async 的 durable dequeue 同一立场。
 - **文件和作业元数据都在 Redis。** 少一个进程依赖。不适合 200MB / 5 万行的生产批量。
 
@@ -288,12 +313,12 @@ make demo
 - 没有鉴权、租户配额，也不剥客户端自带的优先级头。
 - 文件字节存在 Redis 字符串里，没有 S3 生命周期，也没有 `output_expires_after`。
 - 不按 token 估算预算，只按请求数。长上下文会把闸门打歪。
-- 单实例 Redis。Lua 里用字符串拼队列键，不能直接丢进 Redis Cluster。
+- 键已经带 hash tag，回收脚本的键走 `KEYS`。仍然只连一个 Redis 地址，没有 Cluster 客户端。
 - 结果键有 TTL。批输出文件本身不回收。
 - 取消会中止正在进行的上游调用，而不是等 OpenAI 那种最长约 10 分钟的排空。
 - `finalizing` 通常只存在很短一段时间；`finalizing_at` 会写上，轮询不一定能撞见这个状态。
 - 窗口内的 EDF 是近似的。生产上更稳的做法是只入队 `job_id + offset`，派发前再读对象存储。
-- 还没有 Prometheus 指标、OpenTelemetry、webhook，也没有 `X-Async-Mode: wait` 长连接。
+- 指标可以抓取，trace 写在日志里。还没有 OTLP、webhook，也没有 `X-Async-Mode: wait` 长连接。
 - 重复推理没有计费去重之外的经济防护，只有 `MAX_ATTEMPTS` 和 deadline。
 
-下一步如果继续做：对象存储加 checkpoint、Prometheus budget、按 token 加权、以及把 API 和 dispatcher 拆成可独立水平扩展的进程。
+Phase 1 不做对象存储、MySQL、Prometheus 饱和度 gate 和租户鉴权。这些在 RFC 的后续阶段。

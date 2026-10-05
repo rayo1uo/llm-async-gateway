@@ -19,6 +19,15 @@ func TestPick(t *testing.T) {
 	}{
 		{name: "empty", in: Input{Now: now}, ok: false},
 		{
+			name: "interactive outranks async",
+			in: Input{
+				InteractiveReady: 1, InteractiveDeadline: later,
+				NearlineReady: 2, NearlineDeadline: later,
+				Now: now, AgingSlack: time.Minute,
+			},
+			want: model.TierInteractive, ok: true,
+		},
+		{
 			name: "only nearline",
 			in:   Input{NearlineReady: 2, NearlineDeadline: later, Now: now, AgingSlack: time.Minute},
 			want: model.TierNearline, ok: true,

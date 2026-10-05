@@ -13,6 +13,7 @@ import (
 
 	"github.com/rayo1uo/llm-async-gateway/internal/budget"
 	"github.com/rayo1uo/llm-async-gateway/internal/model"
+	"github.com/rayo1uo/llm-async-gateway/internal/pipeline"
 	"github.com/rayo1uo/llm-async-gateway/internal/store"
 )
 
@@ -54,9 +55,23 @@ func (h *holdUpstream) seen() []string {
 	return out
 }
 
-type denyBudget struct{}
+type denyGate struct{}
 
-func (denyBudget) Allow(context.Context, model.Tier) (func(), bool) { return nil, false }
+func (denyGate) Budget(context.Context) float64 { return 0 }
+
+func (denyGate) Apply(context.Context, *pipeline.Request, *[]pipeline.ReleaseFunc) (pipeline.Verdict, error) {
+	return pipeline.VerdictRefuse, nil
+}
+
+func sharedGate(st *store.Store, max, reserved int, lease time.Duration) pipeline.Gate {
+	lim := budget.NewLocal(budget.LocalConfig{
+		MaxConcurrency: max,
+		ReservedBatch:  reserved,
+		RatePerSec:     1000,
+		Burst:          10,
+	})
+	return budget.NewSharedGate(budget.SharedConfig{Local: lim, Store: st, Max: max, LeaseTTL: lease})
+}
 
 func TestDispatcherUsesIdleBatchSlotWhenNearlineIsCapped(t *testing.T) {
 	mr := miniredis.RunT(t)
@@ -66,14 +81,14 @@ func TestDispatcherUsesIdleBatchSlotWhenNearlineIsCapped(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	for _, u := range []*model.Unit{
-		{ID: "req_a", Tier: model.TierNearline, Endpoint: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Deadline: now.Add(2 * time.Hour).UnixMilli(), Created: now.UnixMilli()},
-		{ID: "req_b", Tier: model.TierNearline, Endpoint: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Deadline: now.Add(3 * time.Hour).UnixMilli(), Created: now.UnixMilli()},
-		{ID: "batch_req_c", Tier: model.TierBatch, Endpoint: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Deadline: now.Add(4 * time.Hour).UnixMilli(), Created: now.UnixMilli(), BatchID: "batch_1", CustomID: "c"},
+		{ID: "req_a", Tier: model.TierNearline, Endpoint: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Deadline: now.Add(2 * time.Hour).Unix(), Created: now.Unix()},
+		{ID: "req_b", Tier: model.TierNearline, Endpoint: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Deadline: now.Add(3 * time.Hour).Unix(), Created: now.Unix()},
+		{ID: "batch_req_c", Tier: model.TierBatch, Endpoint: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Deadline: now.Add(4 * time.Hour).Unix(), Created: now.Unix(), BatchID: "batch_1", CustomID: "c"},
 	} {
 		if u.Tier == model.TierNearline {
 			if err := st.PutNearline(ctx, &model.Nearline{
 				ID: u.ID, Object: model.ObjectRequest, Status: model.StatusQueued, Endpoint: u.Endpoint,
-				CreatedAt: now.Unix(), Deadline: time.UnixMilli(u.Deadline).Unix(), DeadlineMS: u.Deadline,
+				CreatedAt: now.Unix(), Deadline: u.Deadline, DeadlineMS: time.Unix(u.Deadline, 0).UnixMilli(),
 				Metadata: map[string]string{},
 			}); err != nil {
 				t.Fatal(err)
@@ -85,9 +100,8 @@ func TestDispatcherUsesIdleBatchSlotWhenNearlineIsCapped(t *testing.T) {
 	}
 	hold := make(chan struct{})
 	up := &holdUpstream{hold: hold}
-	lim := budget.NewLocal(budget.LocalConfig{MaxConcurrency: 2, ReservedBatch: 1, RatePerSec: 1000, Burst: 10})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	d := New(st, lim, up, Options{
+	d := New(st, sharedGate(st, 2, 1, time.Second), up, Options{
 		LeaseTTL: time.Second, PollInterval: 5 * time.Millisecond, RequestTimeout: time.Second,
 		ReserveEvery: 0, AgingSlack: time.Millisecond, ResultTTL: time.Hour,
 		RetryBase: time.Millisecond, RetryMax: 10 * time.Millisecond, MaxAttempts: 3,
@@ -126,11 +140,11 @@ func TestDispatcherExpiresReadyWorkWithoutBudget(t *testing.T) {
 	now := time.Now()
 	u := &model.Unit{
 		ID: "req_old", Tier: model.TierNearline, Endpoint: "/v1/chat/completions",
-		Body: []byte(`{"model":"m"}`), Deadline: now.Add(-time.Second).UnixMilli(), Created: now.UnixMilli(),
+		Body: []byte(`{"model":"m"}`), Deadline: now.Add(-time.Second).Unix(), Created: now.Unix(),
 	}
 	if err := st.PutNearline(ctx, &model.Nearline{
 		ID: u.ID, Object: model.ObjectRequest, Status: model.StatusQueued, Endpoint: u.Endpoint,
-		CreatedAt: now.Unix(), Deadline: now.Add(-time.Second).Unix(), DeadlineMS: u.Deadline,
+		CreatedAt: now.Unix(), Deadline: u.Deadline, DeadlineMS: time.Unix(u.Deadline, 0).UnixMilli(),
 		Metadata: map[string]string{},
 	}); err != nil {
 		t.Fatal(err)
@@ -139,7 +153,7 @@ func TestDispatcherExpiresReadyWorkWithoutBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	d := New(st, denyBudget{}, &recordingUpstream{}, Options{
+	d := New(st, denyGate{}, &recordingUpstream{}, Options{
 		LeaseTTL: time.Second, PollInterval: 5 * time.Millisecond, RequestTimeout: time.Second,
 		ResultTTL: time.Hour, RetryBase: time.Millisecond, RetryMax: time.Millisecond, MaxAttempts: 2,
 	}, logger, nil)
@@ -175,16 +189,16 @@ func TestDispatcherPrefersNearlineOverSoonerBatch(t *testing.T) {
 
 	batchUnit := &model.Unit{
 		ID: "batch_req_early", Tier: model.TierBatch, Endpoint: "/v1/chat/completions",
-		Body: []byte(`{"model":"m"}`), Deadline: now.Add(time.Hour).UnixMilli(), Created: now.UnixMilli(),
+		Body: []byte(`{"model":"m"}`), Deadline: now.Add(time.Hour).Unix(), Created: now.Unix(),
 		BatchID: "batch_1", CustomID: "c",
 	}
 	near := &model.Unit{
 		ID: "req_later", Tier: model.TierNearline, Endpoint: "/v1/chat/completions",
-		Body: []byte(`{"model":"m"}`), Deadline: now.Add(2 * time.Hour).UnixMilli(), Created: now.UnixMilli(),
+		Body: []byte(`{"model":"m"}`), Deadline: now.Add(2 * time.Hour).Unix(), Created: now.Unix(),
 	}
 	if err := st.PutNearline(ctx, &model.Nearline{
 		ID: near.ID, Object: model.ObjectRequest, Status: model.StatusQueued,
-		Endpoint: near.Endpoint, CreatedAt: now.Unix(), Deadline: now.Add(2 * time.Hour).Unix(), DeadlineMS: near.Deadline,
+		Endpoint: near.Endpoint, CreatedAt: now.Unix(), Deadline: near.Deadline, DeadlineMS: time.Unix(near.Deadline, 0).UnixMilli(),
 		Metadata: map[string]string{},
 	}); err != nil {
 		t.Fatal(err)
@@ -197,9 +211,8 @@ func TestDispatcherPrefersNearlineOverSoonerBatch(t *testing.T) {
 	}
 
 	up := &recordingUpstream{}
-	lim := budget.NewLocal(budget.LocalConfig{MaxConcurrency: 1, ReservedBatch: 0, RatePerSec: 1000, Burst: 10})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	d := New(st, lim, up, Options{
+	d := New(st, sharedGate(st, 1, 0, time.Second), up, Options{
 		LeaseTTL: time.Second, PollInterval: 5 * time.Millisecond, RequestTimeout: time.Second,
 		ReserveEvery: 0, AgingSlack: time.Millisecond, ResultTTL: time.Hour,
 		RetryBase: time.Millisecond, RetryMax: 10 * time.Millisecond, MaxAttempts: 3,

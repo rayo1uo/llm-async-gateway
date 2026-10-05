@@ -31,11 +31,18 @@ func TestEnqueueClaimFinish(t *testing.T) {
 		Tier:     model.TierNearline,
 		Endpoint: "/v1/chat/completions",
 		Body:     []byte(`{"model":"m"}`),
-		Deadline: now.Add(time.Hour).UnixMilli(),
-		Created:  now.UnixMilli(),
+		Deadline: now.Add(time.Hour).Unix(),
+		Created:  now.Unix(),
 	}
 	if err := st.Enqueue(ctx, u); err != nil {
 		t.Fatal(err)
+	}
+	if got := st.QueueKey(model.TierAsync); got != "lag:{default}:q:async" {
+		t.Fatalf("queue key=%s", got)
+	}
+	score, err := st.rdb.ZScore(ctx, st.QueueKey(model.TierAsync), u.ID).Result()
+	if err != nil || int64(score) != u.Deadline {
+		t.Fatalf("score=%v deadline=%d err=%v", score, u.Deadline, err)
 	}
 	if n, err := st.QueueLen(ctx, model.TierNearline); err != nil || n != 1 {
 		t.Fatalf("len=%d err=%v", n, err)
@@ -48,7 +55,7 @@ func TestEnqueueClaimFinish(t *testing.T) {
 	if err != nil || empty != nil {
 		t.Fatalf("second claim got=%v err=%v", empty, err)
 	}
-	ok, err := st.ExtendLease(ctx, u.ID, "own_1", now.Add(2*time.Minute))
+	ok, err := st.ExtendLease(ctx, got.ID, got.Token, "own_1", now.Add(2*time.Minute))
 	if err != nil || !ok {
 		t.Fatalf("extend ok=%v err=%v", ok, err)
 	}
@@ -76,8 +83,8 @@ func TestReclaimAndFence(t *testing.T) {
 		Tier:     model.TierBatch,
 		Endpoint: "/v1/chat/completions",
 		Body:     []byte(`{"model":"m"}`),
-		Deadline: now.Add(time.Hour).UnixMilli(),
-		Created:  now.UnixMilli(),
+		Deadline: now.Add(time.Hour).Unix(),
+		Created:  now.Unix(),
 		BatchID:  "batch_1",
 		CustomID: "c1",
 	}
@@ -101,16 +108,19 @@ func TestReclaimAndFence(t *testing.T) {
 	}
 	res := &model.Result{ID: u.ID, Status: model.StatusCompleted, StatusCode: 200, Body: []byte(`{"ok":true}`), FinishedAt: now.Unix()}
 	created, err := st.Finish(ctx, u, "own_old", res, line, model.CountCompleted, true, time.Hour)
-	if err != nil || !created {
-		t.Fatalf("old finish created=%v err=%v", created, err)
+	if err != nil || created {
+		t.Fatalf("stale owner must not write after reclaim, created=%v err=%v", created, err)
 	}
 	again, err := st.Claim(ctx, model.TierBatch, now.Add(time.Minute), "own_new")
 	if err != nil || again == nil {
 		t.Fatalf("reclaim should have restored the unit, got=%v err=%v", again, err)
 	}
+	if again.Token == "" || again.Token == u.Token {
+		t.Fatalf("reclaim should rotate the fencing token, old=%s new=%s", u.Token, again.Token)
+	}
 	created, err = st.Finish(ctx, again, "own_new", res, line, model.CountCompleted, true, time.Hour)
-	if err != nil || created {
-		t.Fatalf("duplicate finish created=%v err=%v", created, err)
+	if err != nil || !created {
+		t.Fatalf("new owner finish created=%v err=%v", created, err)
 	}
 	counts, err := st.BatchCounts(ctx, u.BatchID)
 	if err != nil {
@@ -134,8 +144,8 @@ func TestParkAndPromote(t *testing.T) {
 		Tier:     model.TierNearline,
 		Endpoint: "/v1/embeddings",
 		Body:     []byte(`{"model":"m","input":"x"}`),
-		Deadline: now.Add(time.Hour).UnixMilli(),
-		Created:  now.UnixMilli(),
+		Deadline: now.Add(time.Hour).Unix(),
+		Created:  now.Unix(),
 		Attempts: 1,
 	}
 	if err := st.Enqueue(ctx, u); err != nil {
@@ -177,7 +187,7 @@ func TestCommitBatchInputWindowAndMismatch(t *testing.T) {
 	}
 	unit := &model.Unit{
 		ID: "batch_req_a", Tier: model.TierBatch, Endpoint: line.URL, Body: line.Body,
-		Deadline: now.Add(time.Hour).UnixMilli(), Created: now.UnixMilli(),
+		Deadline: now.Add(time.Hour).Unix(), Created: now.Unix(),
 		BatchID: "batch_w", CustomID: line.CustomID,
 	}
 	status, err := st.CommitBatchInput(ctx, "batch_w", raw+"nope", unit, 1)
@@ -299,11 +309,11 @@ func TestExpireReadyDoesNotNeedALease(t *testing.T) {
 	now := time.Now()
 	late := &model.Unit{
 		ID: "req_late", Tier: model.TierNearline, Endpoint: "/v1/chat/completions",
-		Body: []byte(`{"model":"m"}`), Deadline: now.Add(-time.Second).UnixMilli(), Created: now.UnixMilli(),
+		Body: []byte(`{"model":"m"}`), Deadline: now.Add(-time.Second).Unix(), Created: now.Unix(),
 	}
 	fresh := &model.Unit{
 		ID: "req_fresh", Tier: model.TierNearline, Endpoint: "/v1/chat/completions",
-		Body: []byte(`{"model":"m"}`), Deadline: now.Add(time.Hour).UnixMilli(), Created: now.UnixMilli(),
+		Body: []byte(`{"model":"m"}`), Deadline: now.Add(time.Hour).Unix(), Created: now.Unix(),
 	}
 	if err := st.Enqueue(ctx, late); err != nil {
 		t.Fatal(err)
@@ -337,7 +347,7 @@ func nearlinePair(id string, now time.Time) nearlinePairSet {
 	}
 	unit := &model.Unit{
 		ID: id, Tier: model.TierNearline, Endpoint: rec.Endpoint,
-		Body: []byte(`{"model":"m"}`), Deadline: rec.DeadlineMS, Created: now.UnixMilli(),
+		Body: []byte(`{"model":"m"}`), Deadline: rec.Deadline, Created: now.Unix(),
 	}
 	return nearlinePairSet{rec: rec, unit: unit}
 }
@@ -351,8 +361,8 @@ func TestExpiredLeaseMovesToList(t *testing.T) {
 		Tier:     model.TierBatch,
 		Endpoint: "/v1/completions",
 		Body:     []byte(`{"model":"m"}`),
-		Deadline: now.Add(-time.Second).UnixMilli(),
-		Created:  now.UnixMilli(),
+		Deadline: now.Add(-time.Second).Unix(),
+		Created:  now.Unix(),
 		BatchID:  "batch_x",
 		CustomID: "z",
 	}

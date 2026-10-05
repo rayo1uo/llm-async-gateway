@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -20,20 +21,41 @@ func (s *Store) retryKey() string                { return s.key("retry") }
 func (s *Store) expiredKey() string              { return s.key("expired") }
 func (s *Store) deadlineHash() string            { return s.key("meta", "deadline") }
 func (s *Store) tierHash() string                { return s.key("meta", "tier") }
+func (s *Store) tokenHash() string               { return s.key("meta", "token") }
+func (s *Store) tokenSeqKey() string             { return s.key("meta", "token-seq") }
+func (s *Store) finishedKey() string             { return s.key("finished") }
 func (s *Store) resultKey(id string) string      { return s.key("result", id) }
-func (s *Store) resultPrefix() string            { return s.prefix + ":result:" }
-func (s *Store) queuePrefix() string             { return s.prefix + ":q:" }
 func (s *Store) cancelKey(id string) string      { return s.key("cancel", id) }
 
-// Enqueue persists a unit and inserts it into its tier sorted set, scored by deadline.
-// Batch units also increment the batch outstanding counter.
+// QueueKey is the ready-queue key for tier, including the pool hash tag.
+func (s *Store) QueueKey(tier model.Tier) string { return s.queueKey(tier) }
+
+func (s *Store) laneKeys() []string {
+	return []string{
+		s.deadlineHash(),
+		s.tierHash(),
+		s.finishedKey(),
+		s.tokenHash(),
+		s.tokenSeqKey(),
+		s.queueKey(model.TierInteractive),
+		s.queueKey(model.TierAsync),
+		s.queueKey(model.TierBatch),
+	}
+}
+
+// Enqueue persists a pipeline.Request and inserts it into its tier sorted set.
+// The score is the deadline in Unix seconds. Batch units also increment the
+// batch outstanding counter.
 func (s *Store) Enqueue(ctx context.Context, u *model.Unit) error {
 	if !u.Tier.Valid() {
 		return fmt.Errorf("invalid tier %q", u.Tier)
 	}
-	raw, err := json.Marshal(u)
+	if err := s.ensureToken(ctx, u); err != nil {
+		return err
+	}
+	raw, err := encodeRequest(u, s.queueKey(u.Tier))
 	if err != nil {
-		return fmt.Errorf("encode unit: %w", err)
+		return err
 	}
 	incr := "0"
 	outstanding := s.key("noop")
@@ -47,7 +69,8 @@ func (s *Store) Enqueue(ctx context.Context, u *model.Unit) error {
 		outstanding,
 		s.deadlineHash(),
 		s.tierHash(),
-	}, string(raw), strconv.FormatInt(u.Deadline, 10), u.ID, string(u.Tier), incr).Result()
+		s.tokenHash(),
+	}, string(raw), strconv.FormatInt(u.Deadline, 10), u.ID, string(u.Tier), incr, u.Token).Result()
 	if err != nil {
 		return fmt.Errorf("enqueue: %w", err)
 	}
@@ -56,42 +79,72 @@ func (s *Store) Enqueue(ctx context.Context, u *model.Unit) error {
 
 // GetUnit loads a queued request.
 func (s *Store) GetUnit(ctx context.Context, id string) (*model.Unit, error) {
-	var u model.Unit
-	if err := s.getJSON(ctx, s.unitKey(id), &u); err != nil {
+	b, err := s.rdb.Get(ctx, s.unitKey(id)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get unit: %w", err)
+	}
+	u, err := decodeRequest(b)
+	if err != nil {
 		return nil, err
 	}
-	return &u, nil
+	return u, nil
 }
 
-// SaveUnit overwrites the unit document without moving it between queues.
+// SaveUnit overwrites the request document without moving it between queues.
 func (s *Store) SaveUnit(ctx context.Context, u *model.Unit) error {
-	if err := s.setJSON(ctx, s.unitKey(u.ID), u); err != nil {
+	raw, err := encodeRequest(u, s.queueKey(u.Tier))
+	if err != nil {
 		return err
+	}
+	if err := s.rdb.Set(ctx, s.unitKey(u.ID), raw, 0).Err(); err != nil {
+		return fmt.Errorf("save unit: %w", err)
 	}
 	return nil
 }
 
 // Claim leases the earliest-deadline unit in tier. A nil unit means the queue is empty.
+// The returned unit's Token is the fencing generation stored with the claim.
 func (s *Store) Claim(ctx context.Context, tier model.Tier, leaseUntil time.Time, owner string) (*model.Unit, error) {
-	raw, err := claimScript.Run(ctx, s.rdb, []string{s.queueKey(tier), s.claimedKey()},
-		strconv.FormatInt(leaseUntil.UnixMilli(), 10), owner).Text()
+	raw, err := claimScript.Run(ctx, s.rdb, []string{
+		s.queueKey(tier),
+		s.claimedKey(),
+		s.tokenHash(),
+		s.tokenSeqKey(),
+	}, strconv.FormatInt(leaseUntil.UnixMilli(), 10), owner).Text()
 	if errors.Is(err, redis.Nil) || raw == "" {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}
-	u, err := s.GetUnit(ctx, raw)
+	id, token, ok := splitClaim(raw)
+	if !ok {
+		return nil, fmt.Errorf("claim reply %q", raw)
+	}
+	u, err := s.GetUnit(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("claim load unit: %w", err)
 	}
+	u.Token = token
 	return u, nil
 }
 
-// ExtendLease pushes a claim's visibility timeout forward. ok is false when this owner lost the lease.
-func (s *Store) ExtendLease(ctx context.Context, id, owner string, until time.Time) (bool, error) {
+func splitClaim(raw string) (id, token string, ok bool) {
+	id, rest, found := strings.Cut(raw, "|")
+	if !found || id == "" || rest == "" || strings.Contains(rest, "|") {
+		return "", "", false
+	}
+	return id, rest, true
+}
+
+// ExtendLease pushes a claim's visibility timeout forward.
+// ok is false when this owner and token no longer hold the lease.
+func (s *Store) ExtendLease(ctx context.Context, id, token, owner string, until time.Time) (bool, error) {
 	n, err := extendScript.Run(ctx, s.rdb, []string{s.claimedKey()},
-		id, owner, strconv.FormatInt(until.UnixMilli(), 10)).Int()
+		id, token, owner, strconv.FormatInt(until.UnixMilli(), 10)).Int()
 	if err != nil {
 		return false, fmt.Errorf("extend lease: %w", err)
 	}
@@ -100,12 +153,12 @@ func (s *Store) ExtendLease(ctx context.Context, id, owner string, until time.Ti
 
 // ParkRetry releases the claim and hides the unit until until.
 func (s *Store) ParkRetry(ctx context.Context, u *model.Unit, owner string, until time.Time) error {
-	raw, err := json.Marshal(u)
+	raw, err := encodeRequest(u, s.queueKey(u.Tier))
 	if err != nil {
-		return fmt.Errorf("encode unit: %w", err)
+		return err
 	}
 	_, err = parkScript.Run(ctx, s.rdb, []string{s.claimedKey(), s.unitKey(u.ID), s.retryKey()},
-		u.ID, owner, string(raw), strconv.FormatInt(until.UnixMilli(), 10)).Result()
+		u.ID, u.Token, owner, string(raw), strconv.FormatInt(until.UnixMilli(), 10)).Result()
 	if err != nil {
 		return fmt.Errorf("park retry: %w", err)
 	}
@@ -130,17 +183,37 @@ func (s *Store) EarliestDeadline(ctx context.Context, tier model.Tier) (time.Tim
 	if len(zs) == 0 {
 		return time.Time{}, false, nil
 	}
-	return time.UnixMilli(int64(zs[0].Score)), true, nil
+	return time.Unix(int64(zs[0].Score), 0), true, nil
+}
+
+// Peek returns the earliest ready unit without leasing it.
+func (s *Store) Peek(ctx context.Context, tier model.Tier) (*model.Unit, error) {
+	zs, err := s.rdb.ZRange(ctx, s.queueKey(tier), 0, 0).Result()
+	if err != nil {
+		return nil, fmt.Errorf("peek queue: %w", err)
+	}
+	if len(zs) == 0 {
+		return nil, nil
+	}
+	return s.GetUnit(ctx, zs[0])
+}
+
+// ClaimedLen returns the number of leased members.
+func (s *Store) ClaimedLen(ctx context.Context) (int64, error) {
+	n, err := s.rdb.ZCard(ctx, s.claimedKey()).Result()
+	if err != nil {
+		return 0, fmt.Errorf("claimed len: %w", err)
+	}
+	return n, nil
 }
 
 // Reclaim returns expired leases to their tier queue, or to the expired list when the deadline has passed.
+// A requeued request receives a new fencing token.
 func (s *Store) Reclaim(ctx context.Context, now time.Time) (int, error) {
-	n, err := reclaimScript.Run(ctx, s.rdb, []string{s.claimedKey(), s.expiredKey()},
+	keys := append([]string{s.claimedKey(), s.expiredKey()}, s.laneKeys()...)
+	n, err := reclaimScript.Run(ctx, s.rdb, keys,
 		strconv.FormatInt(now.UnixMilli(), 10),
-		s.resultPrefix(),
-		s.deadlineHash(),
-		s.tierHash(),
-		s.queuePrefix(),
+		strconv.FormatInt(now.Unix(), 10),
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("reclaim: %w", err)
@@ -151,9 +224,8 @@ func (s *Store) Reclaim(ctx context.Context, now time.Time) (int, error) {
 // ExpireReady moves up to 32 ready units in tier whose deadline is at or before now
 // onto the expired list. It does not acquire a dispatch budget.
 func (s *Store) ExpireReady(ctx context.Context, tier model.Tier, now time.Time) (int, error) {
-	n, err := expireReadyScript.Run(ctx, s.rdb, []string{s.queueKey(tier), s.expiredKey()},
-		strconv.FormatInt(now.UnixMilli(), 10),
-		s.resultPrefix(),
+	n, err := expireReadyScript.Run(ctx, s.rdb, []string{s.queueKey(tier), s.expiredKey(), s.finishedKey()},
+		strconv.FormatInt(now.Unix(), 10),
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("expire ready: %w", err)
@@ -162,13 +234,12 @@ func (s *Store) ExpireReady(ctx context.Context, tier model.Tier, now time.Time)
 }
 
 // PromoteRetries moves parked retries whose wait has elapsed back onto the ready queue.
+// Each promoted request receives a new fencing token.
 func (s *Store) PromoteRetries(ctx context.Context, now time.Time) (int, error) {
-	n, err := promoteScript.Run(ctx, s.rdb, []string{s.retryKey(), s.expiredKey()},
+	keys := append([]string{s.retryKey(), s.expiredKey()}, s.laneKeys()...)
+	n, err := promoteScript.Run(ctx, s.rdb, keys,
 		strconv.FormatInt(now.UnixMilli(), 10),
-		s.resultPrefix(),
-		s.deadlineHash(),
-		s.tierHash(),
-		s.queuePrefix(),
+		strconv.FormatInt(now.Unix(), 10),
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("promote retries: %w", err)
@@ -190,7 +261,7 @@ func (s *Store) PopExpired(ctx context.Context) (string, error) {
 }
 
 // Finish records a terminal result exactly once and releases the claim.
-// created is false when a result for this unit already existed.
+// created is false when a result already existed or when owner no longer holds the fencing token.
 // decrOutstanding should be true only for units that passed through Enqueue.
 func (s *Store) Finish(ctx context.Context, u *model.Unit, owner string, res *model.Result, line *model.OutputLine, countField string, decrOutstanding bool, ttl time.Duration) (bool, error) {
 	resRaw, err := json.Marshal(res)
@@ -225,7 +296,10 @@ func (s *Store) Finish(ctx context.Context, u *model.Unit, owner string, res *mo
 	}
 	member := ""
 	if owner != "" {
-		member = u.ID + "|" + owner
+		if u.Token == "" {
+			return false, fmt.Errorf("finish %s: missing request token", u.ID)
+		}
+		member = u.ID + "|" + u.Token + "|" + owner
 	}
 	n, err := finishScript.Run(ctx, s.rdb, []string{
 		s.resultKey(u.ID),
@@ -233,7 +307,8 @@ func (s *Store) Finish(ctx context.Context, u *model.Unit, owner string, res *mo
 		countsKey,
 		outstanding,
 		s.claimedKey(),
-	}, string(resRaw), strconv.Itoa(ttlSec), isBatch, customID, lineRaw, countField, member, decr).Int()
+		s.finishedKey(),
+	}, string(resRaw), strconv.Itoa(ttlSec), isBatch, customID, lineRaw, countField, member, decr, u.ID).Int()
 	if err != nil {
 		return false, fmt.Errorf("finish: %w", err)
 	}
@@ -273,4 +348,24 @@ func (s *Store) IsCancelled(ctx context.Context, id string) (bool, error) {
 		return false, fmt.Errorf("cancel flag: %w", err)
 	}
 	return n == 1, nil
+}
+
+// BatchStatusCounts groups stored batch documents by status.
+func (s *Store) BatchStatusCounts(ctx context.Context) (map[string]float64, error) {
+	ids, err := s.ListBatchIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, id := range ids {
+		b, err := s.GetBatch(ctx, id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		out[b.Status]++
+	}
+	return out, nil
 }

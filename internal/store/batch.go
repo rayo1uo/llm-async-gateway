@@ -169,9 +169,12 @@ func (s *Store) CommitBatchInput(ctx context.Context, batchID, expectedHead stri
 	if window < 1 {
 		window = 1
 	}
-	raw, err := json.Marshal(u)
+	if err := s.ensureToken(ctx, u); err != nil {
+		return "", err
+	}
+	raw, err := encodeRequest(u, s.queueKey(u.Tier))
 	if err != nil {
-		return "", fmt.Errorf("encode unit: %w", err)
+		return "", err
 	}
 	status, err := commitInputScript.Run(ctx, s.rdb, []string{
 		s.inputsKey(batchID),
@@ -180,7 +183,8 @@ func (s *Store) CommitBatchInput(ctx context.Context, batchID, expectedHead stri
 		s.outstandingKey(batchID),
 		s.deadlineHash(),
 		s.tierHash(),
-	}, expectedHead, string(raw), strconv.FormatInt(u.Deadline, 10), u.ID, string(u.Tier), strconv.Itoa(window)).Text()
+		s.tokenHash(),
+	}, expectedHead, string(raw), strconv.FormatInt(u.Deadline, 10), u.ID, string(u.Tier), strconv.Itoa(window), u.Token).Text()
 	if err != nil {
 		return "", fmt.Errorf("commit input: %w", err)
 	}
@@ -207,7 +211,8 @@ func (s *Store) CommitBatchTerminal(ctx context.Context, batchID, expectedHead s
 		s.resultKey(u.ID),
 		s.linesKey(batchID),
 		s.countsKey(batchID),
-	}, expectedHead, string(resRaw), strconv.Itoa(ttlSec), line.CustomID, string(lineRaw), model.CountFailed).Text()
+		s.finishedKey(),
+	}, expectedHead, string(resRaw), strconv.Itoa(ttlSec), line.CustomID, string(lineRaw), model.CountFailed, u.ID).Text()
 	if err != nil {
 		return "", fmt.Errorf("commit terminal: %w", err)
 	}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/rayo1uo/llm-async-gateway/internal/id"
 	"github.com/rayo1uo/llm-async-gateway/internal/model"
+	"github.com/rayo1uo/llm-async-gateway/internal/observe"
 	"github.com/rayo1uo/llm-async-gateway/internal/store"
 )
 
@@ -91,12 +92,13 @@ func (h *Handler) createRequest(w http.ResponseWriter, r *http.Request) {
 		Metadata:   req.Metadata,
 	}
 	unit := &model.Unit{
-		ID:       reqID,
-		Tier:     model.TierNearline,
-		Endpoint: req.Endpoint,
-		Body:     req.Body,
-		Deadline: rec.DeadlineMS,
-		Created:  now.UnixMilli(),
+		ID:          reqID,
+		Tier:        model.TierAsync,
+		Endpoint:    req.Endpoint,
+		Body:        req.Body,
+		Deadline:    rec.Deadline,
+		Created:     now.Unix(),
+		TraceParent: observe.Traceparent(r.Context()),
 	}
 	id, created, err := h.store.AcceptNearline(r.Context(), idemKey, h.opts.IdempotencyTTL, rec, unit)
 	if err != nil {

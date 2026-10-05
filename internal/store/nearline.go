@@ -57,13 +57,16 @@ func (s *Store) SetNearlineStatus(ctx context.Context, id, status string, atUnix
 // original request id; the record and unit from that first call are already present.
 // idemKey empty skips the idempotency check.
 func (s *Store) AcceptNearline(ctx context.Context, idemKey string, ttl time.Duration, rec *model.Nearline, unit *model.Unit) (id string, created bool, err error) {
+	if err := s.ensureToken(ctx, unit); err != nil {
+		return "", false, err
+	}
 	recRaw, err := json.Marshal(rec)
 	if err != nil {
 		return "", false, fmt.Errorf("encode nearline: %w", err)
 	}
-	unitRaw, err := json.Marshal(unit)
+	unitRaw, err := encodeRequest(unit, s.queueKey(unit.Tier))
 	if err != nil {
-		return "", false, fmt.Errorf("encode unit: %w", err)
+		return "", false, err
 	}
 	use := "0"
 	key := s.key("noop")
@@ -82,7 +85,8 @@ func (s *Store) AcceptNearline(ctx context.Context, idemKey string, ttl time.Dur
 		s.queueKey(unit.Tier),
 		s.deadlineHash(),
 		s.tierHash(),
-	}, use, rec.ID, string(recRaw), string(unitRaw), strconv.FormatInt(unit.Deadline, 10), string(unit.Tier), strconv.Itoa(ttlSec)).Text()
+		s.tokenHash(),
+	}, use, rec.ID, string(recRaw), string(unitRaw), strconv.FormatInt(unit.Deadline, 10), string(unit.Tier), strconv.Itoa(ttlSec), unit.Token).Text()
 	if err != nil {
 		return "", false, fmt.Errorf("accept nearline: %w", err)
 	}
