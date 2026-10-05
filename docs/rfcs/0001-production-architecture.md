@@ -4,23 +4,23 @@
 |---|---|
 | 状态 | Proposed（已按评审意见修订，待复审） |
 | 日期 | 2026-10-05 |
-| 修订 | 2026-10-05：术语改为 async；元数据定为 MySQL 8；队列定为 Redis；队列消息与 Gate/Flow 对齐 llm-d-async v0.10.0 |
+| 修订 | 2026-10-05：术语改为 async；元数据定为 MySQL 8；队列定为 Redis。队列消息、Gate、Flow 定义在本仓库 `internal/pipeline`，只在概念上对齐 llm-d-async，不导入、不锁定它的版本。 |
 | 读者 | 本仓库负责人。批准本 RFC 之后才开始重构。 |
 | 范围 | 仅架构决策。本 PR 不改应用代码。 |
 | 基线代码 | 分支 `cursor/llm-async-gateway-demo-08d3`（demo 网关） |
-| 背景材料 | 仓库调研笔记《统一近线与离线批量推理组件调研》（llm-d-async v0.10.0、llm-d-batch-gateway v0.6.0 快照） |
+| 背景材料 | 仓库调研笔记《统一近线与离线批量推理组件调研》。笔记里的上游版本只说明当时读过什么，不是本 RFC 的类型契约。 |
 
 ## 摘要
 
 把 `llm-async-gateway` 从单进程演示收成公司内部自持的异步推理网关：对外继续提供 OpenAI Batch 兼容接口和 async 单请求接口，对内把两种入口收成带 `deadline` / `tier` / `tenant` 的请求单元，用可水平扩展的 gateway-api、dispatcher、batch-controller 去跑。
 
-设计概念对齐 [llm-d-async](https://github.com/llm-d/llm-d-async) 与 [llm-d-batch-gateway](https://github.com/llm-d/llm-d-batch-gateway)（deadline 有序集合、claim/lease/ack、Gate、Flow、tier 通道、Batch 状态机）。队列消息和 Gate/Flow 的类型直接用 llm-d-async v0.10.0 的 `api` 与 `pipeline` module。运行时代码、键空间、指标名和发布节奏保持自持，不 fork、不把它们的二进制嵌进生产路径。二者仍是 0.x，头名和指标名在变；内部 SLO、存储和租户模型需要我们自己掌握。
+设计概念对齐 [llm-d-async](https://github.com/llm-d/llm-d-async) 与 [llm-d-batch-gateway](https://github.com/llm-d/llm-d-batch-gateway)（deadline 有序集合、claim/lease/ack、带 `Budget` 的 Gate、把组件串起来的 Flow、tier 通道、Batch 状态机）。队列消息、Gate 和 Flow 定义在本仓库的 `internal/pipeline`，字段和文档由我们维护。运行时代码、键空间、指标名和发布节奏保持自持，不导入上游 module，也不把它们的二进制嵌进生产路径。上游仍在快速变化；内部 SLO、存储和租户模型需要我们自己掌握。
 
 本 RFC 批准的目标形态：
 
 - **gateway-api**：无状态 HTTP。`/v1/files`、`/v1/batches`、`/v1/requests`。
 - **batch-controller**：校验、按 `job_id + offset` 窗口补货、归并结果、推进状态机。单活。不用 coordinator 这个名字，理由见 3.1。
-- **dispatcher**：按池水平扩展的 `pipeline.Flow`。通道优先级 + 通道内 EDF，claim/lease/ack，至少一次，带 fencing。
+- **dispatcher**：按池水平扩展，内部是本仓库的 `pipeline.Flow`。通道优先级 + 通道内 EDF，claim/lease/ack，至少一次，带 fencing。
 - **MySQL 8（InnoDB）**：作业、文件、async 请求、幂等键等元数据。与 Postgres 的取舍见 3.2。
 - **对象存储**：输入 / 输出 / 错误 JSONL。
 - **Redis（AOF + 副本，`noeviction`）**：队列、租约、重试停车、取消标记、配额计数、async 结果邮箱。不存文件字节。
@@ -42,13 +42,13 @@
 3. **两种入口、一个执行面。**
    - Batch：兼容 OpenAI Files + Batches 的作业语义（状态机、`custom_id`、`request_counts`、output/error JSONL、取消与过期的部分结果）。
    - async：单请求提交后立即返回 id，再轮询或取消。现有 `POST /v1/requests` 就是这条入口。
-4. **概念对齐 llm-d，实现自持。** 队列消息、`Gate` 和 `Flow` 直接用 llm-d-async v0.10.0 的定义。组件边界、存储布局和防饥饿策略按本仓库已经跑通的 demo 往下长。不把上游 dispatcher 二进制嵌进生产路径。
+4. **概念对齐 llm-d，实现自持。** 队列消息、`Gate` 和 `Flow` 的形状参考它们的设计，类型写在本仓库。组件边界、存储布局和防饥饿策略按已经跑通的 demo 往下长。不把上游 dispatcher 二进制嵌进生产路径。
 5. **可分阶段上线。** 每一阶段结束时，仓库仍是一个能跑通 async 与 batch 的网关，并带明确的退出标准。
 
 ### 1.2 非目标
 
 - 替换公司现有的在线同步推理网关（llm-d-router / 其他 OpenAI 兼容入口）。在线流量的 TTFT/TPOT 由那一层负责。本网关只保证自己填进去的异步流量可被让路。
-- Fork `llm-d-async`、`llm-d-batch-gateway` 的进程或 Helm chart，当作生产 dispatcher / 作业控制器。允许的依赖只有 llm-d-async v0.10.0 的 `api` 与 `pipeline` 两个 module（消息类型和 Gate/Flow 接口）。
+- 导入、锁定或 fork `llm-d-async`、`llm-d-batch-gateway` 的 module、进程或 Helm chart。它们的类型不是本仓库的定义。生产 dispatcher 和作业控制器都是我们自己的代码。
 - 推理的恰好一次。GPU 上的重复执行用 fencing、`max_attempts` 和结果去重把成本圈住，不承诺恰好一次。
 - 完整实现 OpenAI Responses 的 `background + stream` 断点续流，以及 Flex `service_tier` 的计费产品。
 - 面向外部客户的计费平台、多云抽象、训练或微调作业。
@@ -58,11 +58,11 @@
 
 | ID | 决定 |
 |---|---|
-| D1 | 自持三进程（api / batch-controller / dispatcher）。队列消息、`Gate`、`Flow` 依赖 llm-d-async v0.10.0 的 `api` 与 `pipeline`。不运行它们的 dispatcher 二进制。 |
+| D1 | 自持三进程（api / batch-controller / dispatcher），以及自持的 `internal/pipeline` 类型。不导入 llm-d 的 module，不运行它们的 dispatcher 二进制。 |
 | D2 | 元数据进 MySQL 8（InnoDB），文件进对象存储，Redis 只放队列、租约和短 TTL 状态。 |
-| D3 | 批量入队用 `api.RequestMessage`。body 引用放在 `metadata` 的 `job_id` 与 offset 字段里，窗口补货；就绪队列里不放整段 body。 |
-| D4 | 优先级通道为 `interactive`、`async`、`batch`（llm-d-async 的 `PriorityTier`）。demo 队列里的字符串 `nearline` 在 Phase 1 改为 `async`。通道内按 deadline 做 EDF。保留 demo 的老化与最低份额。 |
-| D5 | 可组合单位是 `pipeline.Gate`：`Budget(ctx) float64` 加 `Apply`。用 `ApplyChain` 串成本地并发 → 饱和度 → prometheus-budget → tier 准入。Phase 3 再按 token 计。未知 `gate_type` 启动失败（fail closed）。dispatcher 按 `pipeline.Flow` 装配。 |
+| D3 | 批量入队用本仓库的 `pipeline.Message`。body 引用放在 `Metadata` 的 `job_id` 与 offset 字段里，窗口补货；就绪队列里不放整段 body。 |
+| D4 | 优先级通道为 `interactive`、`async`、`batch`。demo 队列里的字符串 `nearline` 在 Phase 1 改为 `async`。通道内按 deadline 做 EDF。保留 demo 的老化与最低份额。 |
+| D5 | 可组合单位是本仓库的 `pipeline.Gate`：`Budget(ctx) float64` 加 `Apply`。用本仓库的 `ApplyChain` 串成本地并发 → 饱和度 → prometheus-budget → tier 准入。Phase 3 再按 token 计。未知 `gate_type` 启动失败（fail closed）。dispatcher 按本仓库的 `pipeline.Flow` 装配。 |
 | D6 | 队列用 Redis，部署先用主从 + AOF。Lua 键从 Phase 1 起带 pool hash tag，避免以后为 Cluster 再改协议。 |
 
 ## 2. 现状评估 / Current state
@@ -73,7 +73,7 @@
 
 这些是后续阶段的不变量。重构可以换进程和存储，不应把这些语义改丢。
 
-**请求单元。** `model.Unit` 把 batch 的一行和 async 的一次提交收成同一条队列消息：`tier`、`deadline`（demo 里是 Unix 毫秒，同时是 sorted set 的 score）、`endpoint`、`body`、可选的 `batch_id` / `custom_id` / `line_index`。API 分开，执行面合一。这和调研笔记第 6 节的建议一致，而且已经有测试。生产队列改用 llm-d-async 的 `RequestMessage`（deadline 为 Unix 秒），见 3.5。语义不变：一条消息就是一次推理。
+**请求单元。** `model.Unit` 把 batch 的一行和 async 的一次提交收成同一条队列消息：`tier`、`deadline`（demo 里是 Unix 毫秒，同时是 sorted set 的 score）、`endpoint`、`body`、可选的 `batch_id` / `custom_id` / `line_index`。API 分开，执行面合一。这和调研笔记第 6 节的建议一致，而且已经有测试。生产队列改用本仓库的 `pipeline.Message`（deadline 为 Unix 秒），见 3.5。语义不变：一条消息就是一次推理。
 
 **接口落在使用方。** `dispatch.Budget` 只有 `Allow(ctx, tier) (release, ok)`。`dispatch.Upstream` 只有 `Do(ctx, unit)`。现在的 `budget.Local` 是进程内令牌桶加 in-flight 上限，并为 batch 留 `RESERVED_BATCH_SLOTS`。dispatcher 循环不关心预算从哪来。
 
@@ -194,7 +194,7 @@ Phase 1 就可以把二进制拆开。Phase 1 的系统记录仍可以是 Redis�
 
 键从 Phase 1 起按池加 hash tag，例如 `lag:{pool}:q:async`、`lag:{pool}:claimed`。一个池的脚本只碰带同一 tag 的键。单机 Redis 下 hash tag 无行为差异；以后进 Cluster 时一个池一个 slot。`reclaim` / `promote` 里用字符串拼接出来的键，改成脚本的 `KEYS`。
 
-async 小 body（阈值建议 32 KiB，可配置）放进 `RequestMessage.Payload`，省一次对象存储读。超过阈值，或任何 batch 行，`Payload` 留空，引用放在 `metadata` 里。
+async 小 body（阈值建议 32 KiB，可配置）放进 `pipeline.Message.Payload`，省一次对象存储读。超过阈值，或任何 batch 行，`Payload` 留空，引用放在 `Metadata` 里。
 
 ### 3.3 队列、优先级与 EDF
 
@@ -210,7 +210,7 @@ async 小 body（阈值建议 32 KiB，可配置）放进 `RequestMessage.Payloa
 
 Phase 4 再把每条通道乘上 `reserved` / `overflow`（租户配额内 / 配额外）。在那之前，调度只有上面三档，其中 `interactive` 可以没有流量，但 Budget 的基线要为它留空。
 
-通道内 score = `RequestMessage.Deadline`，Unix 秒，越小越先出队。同一秒内用请求 id 做稳定次序。demo 现在用毫秒；Phase 1 改成秒，以便直接使用 llm-d-async 的字段。
+通道内 score = `pipeline.Message.Deadline`，Unix 秒，越小越先出队。同一秒内用请求 id 做稳定次序。demo 现在用毫秒；Phase 1 改成秒。秒级精度对 async 和 batch 足够，也让队列文档只有一种时间单位。
 
 跨通道的选择保留 demo 的三条规则，并写成对三档都适用的形式：
 
@@ -225,7 +225,7 @@ Phase 4 再把每条通道乘上 `reserved` / `overflow`（租户配额内 / 配
 沿用 peek → claim → ack，不用 `ZPOPMIN`。
 
 1. Lua 在就绪集合里取 score 最小且 `deadline > now` 的 member，移入 `claimed`，member = `id|request_token|owner`，score = 租约到期。
-2. `request_token` 就是 llm-d-async `InternalRouting.RequestToken`。每次进入就绪集合时新生成（首次入队、回收、重试提升各算一次）。ack 必须同时匹配 `request_token` 与 owner。
+2. `RequestToken` 是 `pipeline.Request` 上的代次。每次进入就绪集合时新生成（首次入队、回收、重试提升各算一次）。ack 必须同时匹配 `RequestToken` 与 owner。
 3. 心跳每 `lease/3` 续租。续租失败说明租约已被回收，worker 丢掉这次结果，不再写终态。
 4. 成功、不可重试失败、取消、过期：在同一个脚本里，核对 fencing 通过后写结果、从 `claimed` 删除、更新计数。fencing 失败则只记日志，等合法持有者或回收逻辑处理。
 5. 可重试失败：释放 claim，把原 deadline 放进 retry 集合，到期后再入就绪集合。retry 期间不占用预算槽。
@@ -235,20 +235,78 @@ Phase 4 再把每条通道乘上 `reserved` / `overflow`（租户配额内 / 配
 
 ### 3.5 窗口入队：`job_id + offset`
 
-队列里的消息直接用 llm-d-async v0.10.0 的类型，不另定义平行结构体：
+队列消息是本仓库的类型，放在 `internal/pipeline`。概念上接近 llm-d-async 的「一条带 deadline 的队列消息，再套一层内部信封」（代次、队列名、重试次数）。字段名、JSON 和注释以本节为准。不导入那个项目的 package，也不跟随它的某次发布。
 
-- 对外可见部分是 `api.RequestMessage`：`id`、`created`、`deadline`（Unix 秒）、`payload`、`metadata`、`headers`、`endpoint`。
-- 持久化信封是 `api.InternalRequest`：上面的消息加上 `InternalRouting`（`request_token`、队列名、`labels`、重试次数）。JSON 用他们已有的 tagged envelope（`internal`、`request_kind`、`data`）。
-- 依赖是 Go module `github.com/llm-d/llm-d-async/api`，锁定 **v0.10.0**。该 module 的 `go` 行是 1.26.0。Phase 1 把本仓库的 Go 版本升到与之相同再引入，本 PR 不改代码。不复制一份会自己漂移的结构体，也不依赖他们的 Redis 实现和 `cmd`。
+```go
+// internal/pipeline
+package pipeline
 
-Batch 行的 `RequestMessage` 长这样。`payload` 留空，引用放在 `metadata`（值都是字符串，符合 `map[string]string`）。controller 是这条消息的生产者，所以由它写入 `metadata`，和 llm-d-async「metadata 由生产者提供、处理器不改写」一致。
+// Tier 是调度通道。客户端不能填写。
+type Tier string
+
+const (
+	TierInteractive Tier = "interactive"
+	TierAsync       Tier = "async"
+	TierBatch       Tier = "batch"
+)
+
+// Message 是一次推理。小 body 放在 Payload。
+// batch 行和大 body 把 Payload 留空，位置写在 Metadata。
+type Message struct {
+	ID       string            `json:"id"`
+	Created  int64             `json:"created"`  // Unix 秒
+	Deadline int64             `json:"deadline"` // Unix 秒，同时是 sorted set 的 score
+	Tier     Tier              `json:"tier"`
+	Tenant   string            `json:"tenant,omitempty"` // 服务端写入
+	Endpoint string            `json:"endpoint"`
+	Payload  json.RawMessage   `json:"payload,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"` // 服务端打标
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// Request 是入队之后的内部信封。RequestToken 是 fencing 代次。
+type Request struct {
+	Message      Message           `json:"message"`
+	RequestToken string            `json:"request_token"`
+	Queue        string            `json:"queue"`
+	ResultQueue  string            `json:"result_queue,omitempty"`
+	RetryCount   int               `json:"retry_count,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"` // reserved / overflow，Phase 4
+}
+
+// Result 是一次推理的终态。HTTP API 再翻译成对外 JSON。
+type Result struct {
+	ID           string `json:"id"`
+	RequestToken string `json:"request_token"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	Payload      []byte `json:"payload,omitempty"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+}
+```
+
+`Metadata` 的键（值都是字符串）：
+
+| 键 | 谁写 | 含义 |
+|---|---|---|
+| `job_id` | batch-controller | 所属作业 |
+| `custom_id` | batch-controller | 输入行的 `custom_id` |
+| `request_index` | batch-controller | 行号 |
+| `payload_bucket`、`payload_key`、`payload_offset`、`payload_length` | batch-controller，或超阈值的 async | 对象存储上的 body 范围 |
+| `traceparent` | gateway-api | 跨进程 trace |
+
+生产者（API 或 controller）写 `Metadata`。dispatcher 不改这些键，也不接受客户端指定 `Tier` 或 `Tenant`。
+
+Batch 行的 `Message`：
 
 ```json
 {
   "id": "batch_req_…",
   "created": 1764044000,
   "deadline": 1764045130,
-  "payload": {},
+  "tier": "batch",
+  "tenant": "team-a",
+  "endpoint": "/v1/chat/completions",
   "metadata": {
     "job_id": "batch_…",
     "custom_id": "row-42",
@@ -257,14 +315,13 @@ Batch 行的 `RequestMessage` 长这样。`payload` 留空，引用放在 `metad
     "payload_key": "inputs/file_…",
     "payload_offset": "18432",
     "payload_length": "912"
-  },
-  "endpoint": "/v1/chat/completions"
+  }
 }
 ```
 
-`InternalRouting.Labels` 带 `tier=batch`（他们的 `PriorityTier`）。`request_token` 用于 fencing。async 的小请求把推理 JSON 放在 `payload`，不带 `payload_*` 字段。超过大小阈值时与 batch 一样改走 metadata 引用。
+async 的小请求把推理 JSON 放在 `payload`，不带 `payload_*`。超过大小阈值时与 batch 一样改走 `Metadata` 引用。
 
-发给上游之前，dispatcher 若看到 `payload_offset` 就按 range 读对象存储，用读到的 JSON 作为 HTTP body。上游看不到 metadata 里的引用。
+发给上游之前，dispatcher 若看到 `payload_offset` 就按 range 读对象存储，用读到的 JSON 作为 HTTP body。上游看不到 `Metadata` 里的引用。
 
 Controller 的做法：
 
@@ -276,24 +333,38 @@ Controller 的做法：
 
 窗口的代价与 demo 相同：跨作业 EDF 只在「已经入队的那一窗」里精确。更早的作业靠 controller 按 deadline 优先补货来近似。这是有意接受的权衡，用来换 Redis 内存有界和取消时不用扫全量消息。
 
-async 不走窗口。API 在准入通过后直接把 `RequestMessage` 写入 `async` 队列。
+async 不走窗口。API 在准入通过后直接把 `pipeline.Request` 写入 `async` 队列。
 
 ### 3.6 Gate 与 Flow
 
-可组合的单位是 llm-d-async v0.10.0 `pipeline.Gate`，不是单独发明的 `Budget` 接口。`Budget` 是 Gate 上的一个方法：
+可组合的单位是本仓库 `internal/pipeline` 里的 `Gate`。`Budget` 是它的一个方法，用来表示还剩多少容量。这个拆法参考了 llm-d-async 里「闸门既报预算、又对单条请求做准入」的做法，接口本身由我们定义。
 
 ```go
+type Verdict int
+
+const (
+    VerdictContinue Verdict = iota // 放行
+    VerdictRefuse                  // 退回队列，不占着 worker
+    VerdictWait                    // 停在内存里等。默认不用
+    VerdictDrop                    // 直接终态，不再重试
+)
+
+type ReleaseFunc func()
+
 type Gate interface {
-    // 返回 [0, 1]。0 表示没有余量，1 表示空闲。
+    // Budget 返回 [0, 1]。0 表示没有余量，1 表示空闲。
     Budget(ctx context.Context) float64
-    // 对一条 InternalRequest 做准入。Continue / Refuse / Wait / Drop。
-    Apply(ctx context.Context, msg *api.InternalRequest, releases *[]GateReleaseFunc) (Verdict, error)
+    // Apply 对一条 Request 做准入。
+    Apply(ctx context.Context, req *Request, releases *[]ReleaseFunc) (Verdict, error)
 }
+
+// ApplyChain 按顺序调用 gates。任一道不是 Continue 就停，并回滚这一轮拿到的 release。
+func ApplyChain(ctx context.Context, req *Request, gates []Gate, releases *[]ReleaseFunc) (Verdict, error)
 ```
 
-容量类闸门用 `Budget()` 表达剩余比例。准入类闸门（并发、配额、tier）在 `Apply` 里决定放行、退回或丢弃。多道闸门用他们的 `ApplyChain` 按顺序执行，任一道不是 `Continue` 就停，并回滚这一轮已经拿到的 release。
+容量类闸门用 `Budget()` 表达剩余比例。准入类闸门（并发、配额、tier）在 `Apply` 里决定放行、退回或丢弃。
 
-demo 里的 `dispatch.Budget.Allow` 到 Phase 1 就换成 `Gate`。Phase 1 只实现本地并发这一道；饱和度、prometheus-budget 和 token 记账在 Phase 3 加进同一条 `ApplyChain`。
+demo 里的 `dispatch.Budget.Allow` 到 Phase 1 就换成 `pipeline.Gate`。Phase 1 只实现本地并发这一道；饱和度、prometheus-budget 和 token 记账在 Phase 3 加进同一条 `ApplyChain`。
 
 闸门按这个顺序叠，最终决定取最严的一个：
 
@@ -311,22 +382,39 @@ demo 里的 `dispatch.Budget.Allow` 到 Phase 1 就换成 `Gate`。Phase 1 只�
 
 Phase 3 把「条数 N」换成「估算 token」：`Σ est_tokens ≤ token_capacity × (D − B_tier)`。估算先用字符近似（例如 `len/4`），调用方若已给出 `max_tokens` 则计入输出预留。精确 tokenizer 不是本阶段的退出条件。
 
-未识别的闸门配置让进程启动失败。llm-d-async 把未知 `gate_type` 退化成恒开闸门，那个行为我们不学。
+未识别的闸门配置让进程启动失败。配错闸门不能变成不限流。
 
-`Apply` 返回 `Refuse` 时不 claim，消息留在队列里。默认不用 `ActionWait`：那会把 worker 停在内存里轮询闸门。已经 claim 的请求若在飞行中发现饱和，按重试路径停车，不丢弃。
+`Apply` 返回 `VerdictRefuse` 时不 claim，消息留在队列里。默认不用 `VerdictWait`：那会把 worker 停在内存里轮询闸门。已经 claim 的请求若在飞行中发现饱和，按重试路径停车，不丢弃。
 
-**Flow。** dispatcher 进程实现 `pipeline.Flow`，用来把组件串起来，具体存储和 HTTP 客户端留在进程入口装配：
+**Flow。** dispatcher 进程实现本仓库的 `pipeline.Flow`，用来把组件串起来。Redis、MySQL、对象存储和 HTTP 在 `cmd` 里注入。加一种闸门或一种合并策略时，不改 claim/ack 循环。
 
-| Flow 上的接口 | 我们的实现 | 可替换的部分 |
+```go
+type Channel struct {
+    Queue string
+    Tier  Tier
+    Gates []Gate
+}
+
+type MergePolicy interface {
+    // 按优先级、老化和最低份额从多个通道里选出下一条。输出按推理池分开。
+    Next(ctx context.Context, channels []Channel) (pool string, req *Request, ok bool)
+}
+
+type Flow interface {
+    Channels() []Channel
+    Merge() MergePolicy
+    Results() <-chan Result
+}
+```
+
+| 组成部分 | 我们的实现 | 可替换的部分 |
 |---|---|---|
-| `RequestChannel` | 每个 tier 一条通道，通道上挂一条 Gate 链 | 队列后端。v1 只有 Redis sorted set |
-| `RequestMergePolicy` | 优先级 + 老化 + 最低份额，输出按池分开 | 合并策略。可以换成他们的严格 `tier-priority` |
+| `Channel` | 每个 tier 一条，上面挂一条 Gate 链 | 队列后端。v1 只有 Redis sorted set |
+| `MergePolicy` | 优先级 + 老化 + 最低份额 | 合并策略本身。换实现时不改 worker |
 | Worker pool | 一组 goroutine，上限由 Gate 给出 | 上游客户端（`Upstream`） |
-| `ResultChannel` | 写出 `api.ResultMessage` | 消费者。async 写 Redis 邮箱，batch 由 controller 收 |
+| `Results` | 写出 `pipeline.Result` | 消费者。async 写 Redis 邮箱，batch 由 controller 收 |
 
-`Flow` 的代码只依赖 `api` 与 `pipeline` 的类型。Redis、MySQL、对象存储和 HTTP 都在 `cmd` 里注入。加一种闸门或一种合并策略时，不改 claim/ack 循环。
-
-内部结果用 `api.ResultMessage`（`status_code`、`payload`、`error_code`）。HTTP 层把错误码翻成 demo 已经公开的小写形式（`DEADLINE_EXCEEDED` → `deadline_exceeded`），已有客户端不用改。`InternalResult.RequestToken` 用来去掉重复投递。
+`pipeline.Result.ErrorCode` 使用 demo 已经公开的小写错误码（`deadline_exceeded`、`cancelled`、`upstream_error`、`max_attempts_exceeded`）。`RequestToken` 用来去掉重复投递。HTTP 层把 `Result` 翻译成现有的对外 JSON。
 
 ### 3.7 async API 形态
 
@@ -366,8 +454,8 @@ Batch HTTP 面保持现有路由：`/v1/files`、`/v1/batches` 的创建、查�
 
 ### 3.8 结果
 
-- **async：** 终态是 `api.ResultMessage`，写入 Redis 邮箱，TTL 沿用 `RESULT_TTL`（默认 48h）。超过大小阈值的 body 放对象存储，邮箱只留引用。`GET` 命中后可以把 TTL 缩短到一个宽限窗口（建议 60s，可配置）。
-- **Batch：** dispatcher 把单行 `ResultMessage` 写到该作业的结果流（Redis stream 或 list，带 `request_token`）。controller 单活消费，按 `custom_id` 去重，追加到对象存储上的 output/error 对象，更新 `request_counts` 和 `usage`。周期性 checkpoint。全部终态后进入 `finalizing`，上传完成再 `completed`。
+- **async：** 终态是 `pipeline.Result`，写入 Redis 邮箱，TTL 沿用 `RESULT_TTL`（默认 48h）。超过大小阈值的 body 放对象存储，邮箱只留引用。`GET` 命中后可以把 TTL 缩短到一个宽限窗口（建议 60s，可配置）。
+- **Batch：** dispatcher 把单行 `pipeline.Result` 写到该作业的结果流（Redis stream 或 list，带 `RequestToken`）。controller 单活消费，按 `custom_id` 去重，追加到对象存储上的 output/error 对象，更新 `request_counts` 和 `usage`。周期性 checkpoint。全部终态后进入 `finalizing`，上传完成再 `completed`。
 - 输出行格式保持现在的 OpenAI 形状：`id`、`custom_id`、`response{status_code,request_id,body}`、`error`。
 - 作业到期：停止补货，未执行行写 `batch_expired`，已成功行保留，作业状态 `expired`。
 - 取消：状态先 `cancelling`，排空或中止在途（上限可配置，默认对齐 OpenAI 约 10 分钟，demo 的「下次心跳就中止」收成 `CANCEL_DRAIN=0s` 的兼容开关），然后 `cancelled`，并保留部分输出。
@@ -381,26 +469,26 @@ Batch HTTP 面保持现有路由：`/v1/files`、`/v1/batches` 的创建、查�
 | 上游概念 | 落到本仓库 | 决定 | 理由 |
 |---|---|---|---|
 | Async Processor 二进制 | `cmd/dispatcher` | 分叉 | 0.x 仍在改结果消息、指标名和头名。生产路径不嵌入上游进程。 |
-| `api.RequestMessage` / `InternalRequest` | 队列消息直接用 v0.10.0 的这两个类型 | 采用 | 不再定义平行结构体。batch 的偏移放在 `metadata` 字符串字段里。 |
-| `pipeline.Gate`（`Budget` + `Apply`）与 `ApplyChain` | dispatcher 的闸门链 | 采用 | `Budget()` 表示剩余容量，`Apply` 做准入。demo 的 `Allow` 只留到 Phase 3 之前。 |
-| `pipeline.Flow` | dispatcher 的装配方式 | 采用 | 接口用他们的。Redis、MySQL、HTTP 在 `cmd` 注入。合并策略自写，因为要保留老化。 |
-| `redis-sortedset`，score = deadline | `{prefix}:{pool}:q:{tier}`，score = deadline 的 Unix 秒 | 采用 | 与 `RequestMessage.Deadline` 一致。同一秒用 id 排次序。 |
+| 队列消息 + 内部信封（deadline、payload、metadata、代次） | `internal/pipeline` 的 `Message` 与 `Request` | 改造 | 概念对齐。类型、字段名和 JSON 由本仓库定义，不导入上游 package。偏移放在 `Metadata`。 |
+| Gate：`Budget` + 对单条请求的准入，以及闸门链 | `pipeline.Gate` 与 `ApplyChain` | 改造 | 同样的职责拆分。接口写在本仓库。demo 的 `Allow` 在 Phase 1 换成 `Gate`。 |
+| 把队列、合并策略、worker、结果串起来的 Flow | `pipeline.Flow` | 改造 | 装配方式对齐。合并策略自写，因为要保留老化。Redis、MySQL、HTTP 在 `cmd` 注入。 |
+| sorted set，score = deadline | `{prefix}:{pool}:q:{tier}`，score = `Message.Deadline` 的 Unix 秒 | 采用 | 同一秒用 id 排次序。 |
 | `redis-pubsub` | 不引入 | 分叉 | 上游已弃用，且没有队列级闸门。 |
-| Durable dequeue：peek → claim → ack，owner token | `claimed` member = `id\|request_token\|owner`，ack 前核对 | 改造 | `request_token` 用他们的字段。键名仍是我们自己的 `lag:` 前缀。 |
+| Durable dequeue：peek → claim → ack，owner token | `claimed` member = `id\|RequestToken\|owner`，ack 前核对 | 改造 | 代次字段是我们的 `Request.RequestToken`。键名用 `lag:` 前缀。 |
 | at-least-once，无 DLQ，以 deadline 终止 | 同样的投递语义，外加 `MAX_ATTEMPTS` | 改造 | deadline 不够挡住毒请求。超次数写 `max_attempts_exceeded`。 |
 | Worker pool（处理器内部并发，不是 InferencePool） | Flow 里的 worker pool，上限由 Gate 给出 | 采用 | 并发 ≈ 吞吐 × 上游时延。 |
 | 六级严格通道：tier × reserved/overflow | 三档 `interactive` / `async` / `batch`，Phase 4 再乘 reserved/overflow；加上老化与最低份额 | 改造 | 严格优先级会把 batch 饿到过期。demo 的护栏已经写明这个取舍。 |
-| `PriorityTier` 的 `async` | demo 队列字符串 `nearline` | 改造 | HTTP 路径仍是 `/v1/requests`。Phase 1 把 tier 字符串改成 `async`。没有生产数据要迁。 |
+| 通道名 async / interactive / batch | `pipeline.Tier`；demo 队列字符串 `nearline` | 改造 | HTTP 路径仍是 `/v1/requests`。Phase 1 把 tier 字符串改成 `async`。没有生产数据要迁。 |
 | `prometheus-budget`：`N = max_SYS × (D − B)` | 一个 `Gate`，按 tier 不同的 B | 采用 | `Budget()` 返回剩余比例。指标名用我们自己的，查询语句按实际上游配置。 |
 | `prometheus-saturation` | Gate 链的一层 | 采用 | 饱和时低通道让路。 |
 | `local-max-concurrency` | 一个 Gate，外加 Redis 共享计数 | 改造 | 本地桶在多副本下会放大全局并发，必须加共享上限。 |
 | `tier-priority-admission` | 饱和时的通道准入 | 采用 | 拒绝时留在队列里。 |
-| `composite` 取最小预算 | `ApplyChain` | 采用 | |
+| 多道闸门取最严的一道 | `pipeline.ApplyChain` | 改造 | 链式组合的想法对齐。函数是我们的。 |
 | `wait-on-refuse`（worker 内存里轮询闸门） | 不采用 | 分叉 | 闸门没开就不要 claim，worker 回去睡觉。避免占着 goroutine。 |
 | 未知 `gate_type` 退化成恒开 | 启动失败 | 分叉 | 配错闸门不应变成不限流。 |
 | `redis-leased-rate`，过期 fail closed | 可选闸门，Phase 3 之后 | 采用 | 给容量规划器留口，默认不启用。 |
 | `redis-quota` | Phase 4 | 改造 | 配额内/外对应 reserved/overflow。计数可以在 Redis，账本在 MySQL。 |
-| 结果消息与 `DurableResultProducer` | 内部用 `api.ResultMessage`，HTTP 层翻译字段 | 采用 | 队列上的结果不再自定义。对外 JSON 仍是 demo 已公开的形状。 |
+| 带代次的结果投递 | 内部用 `pipeline.Result`，HTTP 层翻译成现有 JSON | 改造 | 结果类型自持。对外字段仍是 demo 已公开的形状。 |
 | 指数退避 + `Retry-After` 钳制 | `internal/retry` | 采用 | 已实现。 |
 | `x-llm-d-inference-objective`、fairness id、`slo-ttft-ms` | dispatcher 在确认上游版本之后再写 | 改造 | 上游头名有过 `x-gateway-*` 与 `x-llm-d-*` 的漂移。用配置锁定，不把客户端的头透传。 |
 | `llm_d_async_*` 指标名 | `llm_async_gateway_*` | 分叉 | 自持看板。覆盖面见第 5.6 节，对齐的是「有哪些数」，不是字符串。 |
@@ -539,10 +627,10 @@ Trace（W3C `traceparent` 放进 unit，跨进程不断）：
 **内容。**
 
 - 三个二进制：`gateway-api`、`batch-controller`、`dispatcher`。`cmd/gateway` 可以变成分发入口或薄封装，避免 demo 脚本立刻作废。
-- 引入 `github.com/llm-d/llm-d-async/api` 与 `pipeline`，锁定 v0.10.0。本仓库 `go` 版本升到这两个 module 要求的 1.26。只依赖这两个 module。
-- 新入队的消息改为 `InternalRequest`。deadline 与 sorted set score 改为 Unix 秒。
+- 在 `internal/pipeline` 落下第 3.5、3.6 节的类型。不新增对 llm-d module 的依赖，Go 版本保持仓库现有要求。
+- 新入队的消息改为 `pipeline.Request`。deadline 与 sorted set score 改为 Unix 秒。
 - Controller 用带 fencing token 的 Redis 锁选主。API 副本不再跑 reconcile。
-- Dispatcher 按 `Flow` 装配。Phase 1 的 Gate 仍是本地并发加 Redis 共享计数，接口已经是 `Gate`，不再新增 `Budget.Allow`。
+- Dispatcher 按 `pipeline.Flow` 装配。Phase 1 的 Gate 仍是本地并发加 Redis 共享计数，接口已经是 `pipeline.Gate`。
 - 队列键改为 `lag:{default}:q:async` 与 `lag:{default}:q:batch`。tier 字符串 `nearline` 改为 `async`。回收与提升脚本的键全部进入 `KEYS`。
 - `/metrics` 与 trace，覆盖第 5.6 节里不依赖 MySQL 的那些。
 - 文件和作业记录仍在 Redis。HTTP 路径与 JSON 字段保持兼容。
@@ -563,7 +651,7 @@ Trace（W3C `traceparent` 放进 unit，跨进程不断）：
 - MySQL 存文件元数据、batch、async 请求记录、幂等键、入队游标。
 - 对象存储存文件字节和 output/error JSONL。
 - Redis 只留队列、claimed、retry、取消标记、锁、共享计数、async 邮箱。
-- Batch 的 `RequestMessage.metadata` 带第 3.5 节的 offset 字段，`payload` 为空。校验改为流式，plan 可在崩溃后续跑。
+- Batch 的 `pipeline.Message.Metadata` 带第 3.5 节的 offset 字段，`Payload` 为空。校验改为流式，plan 可在崩溃后续跑。
 - 实现 `output_expires_after` 和 GC。
 - Batch 创建补上 `Idempotency-Key`。
 - 上传上限按 OpenAI 量级放开到 200 MB / 5 万行（可配置），CI 里用较小夹具证明流式与偏移读，不把 200 MB 当每次提交的负担。
@@ -579,7 +667,7 @@ Trace（W3C `traceparent` 放进 unit，跨进程不断）：
 
 **内容。**
 
-- 按第 3.6 节把 `local`、`saturation`、`prometheus-budget`、`tier-priority`、`aimd` 实现成 `pipeline.Gate`，用 `ApplyChain` 串起来。未知 `gate_type` 启动失败。
+- 按第 3.6 节把 `local`、`saturation`、`prometheus-budget`、`tier-priority`、`aimd` 实现成 `pipeline.Gate`，用本仓库的 `ApplyChain` 串起来。未知 `gate_type` 启动失败。
 - 每 tier 的基线可配置。`interactive` 通道存在于调度器里，即使没有生产者。
 - 准入和预算按估算 token 记账。短请求和长请求在测试里消耗不同的预算。
 - 模型到 pool、pool 到上游 URL 的静态映射。仍可以只配置一个 pool。
@@ -656,11 +744,11 @@ Phase 3 的假指标源不依赖 Phase 2 的对象存储，但按池分片的键
 
 ### 批准即表示同意
 
-- [ ] **D1** 自持 api / batch-controller / dispatcher。队列消息与 Gate/Flow 用 llm-d-async v0.10.0 的 `api`、`pipeline`。不运行它们的二进制。
+- [ ] **D1** 自持 api / batch-controller / dispatcher 和 `internal/pipeline`。不导入 llm-d module，不运行它们的二进制。
 - [ ] **D2** MySQL 8 放元数据，对象存储放文件，Redis（AOF + 副本 + `noeviction`）只放队列、租约和短 TTL 状态。
-- [ ] **D3** 批量消息是 `RequestMessage`，偏移在 `metadata`，窗口补货。
+- [ ] **D3** 批量消息是 `pipeline.Message`，偏移在 `Metadata`，窗口补货。
 - [ ] **D4** 通道为 `interactive` / `async` / `batch`，通道内 EDF，保留老化与最低份额。demo 的 `nearline` 改名为 `async`。
-- [ ] **D5** 闸门是 `pipeline.Gate`（`Budget` + `Apply`），用 `ApplyChain` 组合。未知闸门 fail closed。Phase 3 按 token 计。dispatcher 是 `Flow`。
+- [ ] **D5** 闸门是本仓库的 `pipeline.Gate`（`Budget` + `Apply`），用本仓库的 `ApplyChain` 组合。未知闸门 fail closed。Phase 3 按 token 计。dispatcher 是 `pipeline.Flow`。
 - [ ] **D6** Phase 1 起键带 pool hash tag；集群形态先主从，不先上 Cluster。
 - [ ] 第 2.1 节列出的 demo 不变量（单元模型、Lua 原子性、至少一次、防饥饿、窗口、OpenAI 状态机）在重构中保持。
 - [ ] 第 6 节的阶段顺序和每阶段退出标准可以当作后续 PR 的完成定义。
@@ -678,11 +766,6 @@ Phase 3 的假指标源不依赖 Phase 2 的对象存储，但按池分片的键
 ## 参考
 
 - 本仓库 `README.md`：demo 的实际行为。
-- 调研笔记（llm-d-async @ v0.10.0，llm-d-batch-gateway @ v0.6.0）：OpenAI Batch 语义、Budget 公式、durable dequeue、存储分工。本 RFC 的映射表以该快照为准；上游后续版本变化不自动改变 D1–D6。
+- 调研笔记：OpenAI Batch 语义、预算公式、durable dequeue、存储分工的背景。类型以本 RFC 第 3.5、3.6 节为准。
 - OpenAI Batch 指南：<https://platform.openai.com/docs/guides/batch>
-- llm-d-async v0.10.0 消息类型：<https://github.com/llm-d/llm-d-async/blob/v0.10.0/api/api.go>
-- llm-d-async v0.10.0 `Gate`：<https://github.com/llm-d/llm-d-async/blob/v0.10.0/pipeline/gate.go>
-- llm-d-async v0.10.0 `Flow`：<https://github.com/llm-d/llm-d-async/blob/v0.10.0/pipeline/pipeline.go>
-- llm-d-async dispatch budget：<https://github.com/llm-d/llm-d-async/blob/main/docs/dispatch-budget.md>
-- llm-d-async durable dequeue：<https://github.com/llm-d/llm-d-async/blob/main/docs/guides/durable-dequeue.md>
-- llm-d-batch-gateway 架构：<https://github.com/llm-d/llm-d-batch-gateway/blob/main/docs/design/batch_inference_architecture.md>
+- 相关阅读（概念，不是本仓库的类型定义）：[llm-d-async](https://github.com/llm-d/llm-d-async)、[llm-d-batch-gateway](https://github.com/llm-d/llm-d-batch-gateway)。
