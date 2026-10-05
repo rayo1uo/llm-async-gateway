@@ -386,33 +386,63 @@ Phase 3 把「条数 N」换成「估算 token」：`Σ est_tokens ≤ token_cap
 
 `Apply` 返回 `VerdictRefuse` 时不 claim，消息留在队列里。默认不用 `VerdictWait`：那会把 worker 停在内存里轮询闸门。已经 claim 的请求若在飞行中发现饱和，按重试路径停车，不丢弃。
 
-**Flow。** dispatcher 进程实现本仓库的 `pipeline.Flow`，用来把组件串起来。Redis、MySQL、对象存储和 HTTP 在 `cmd` 里注入。加一种闸门或一种合并策略时，不改 claim/ack 循环。
+**Flow。** dispatcher 实现本仓库的 `pipeline.Flow`，并由它编排消费循环，而不是只拿一组通道自己轮询。生命周期对齐 llm-d-async，类型仍定义在本仓库：`Start` 开始消费，并拉起 retry 与 result 两个 worker；`StopConsuming` 停止新的 claim，等消费循环退出，然后关闭请求通道；`Shutdown` 停掉 retry 和 result worker，并且只在推理 worker 把重试和结果送完之后调用。Redis、MySQL、对象存储和 HTTP 在 `cmd` 里注入。加一种闸门或一种合并策略时，不改 claim/ack。
 
 ```go
-type Channel struct {
-    Queue string
-    Tier  Tier
-    Gates []Gate
+type Characteristics struct {
+    HasExternalBackoff     bool // 重试由 Flow 按 Backoff 停进队列，worker 自己不睡
+    SupportsMessageLatency bool
 }
 
-type MergePolicy interface {
-    // 按优先级、老化和最低份额从多个通道里选出下一条。输出按推理池分开。
-    Next(ctx context.Context, channels []Channel) (pool string, req *Request, ok bool)
+type RequestChannel struct {
+    Queue        string
+    Tier         Tier
+    Gate         Gate
+    WorkerPoolID string
+    Channel      chan DispatchMessage // Flow 在 claim 之后写入
+}
+
+type DispatchMessage struct {
+    Request  *Request
+    Owner    string
+    Releases []ReleaseFunc
+}
+
+// PoolDispatch 是合并策略的输出：每个推理池一条通道。
+type PoolDispatch struct {
+    Channels map[string]chan DispatchMessage
+}
+
+type RequestMergePolicy interface {
+    MergeRequestChannels(channels []RequestChannel) PoolDispatch
+}
+
+type RetryMessage struct {
+    Request *Request
+    Owner   string
+    Backoff time.Duration
 }
 
 type Flow interface {
-    Channels() []Channel
-    Merge() MergePolicy
-    Results() <-chan Result
+    Characteristics() Characteristics
+    Start(ctx context.Context)
+    StopConsuming()
+    Shutdown()
+    RequestChannels() []RequestChannel
+    RetryChannel() chan RetryMessage
+    ResultChannel() chan Result
 }
 ```
 
+准入顺序仍是优先级、老化和最低份额，在 Flow 的消费循环里、claim 之前决定。`RequestMergePolicy` 把已经 claim 的消息按池汇合。一个池的背压不挡住另一个池。Phase 1 只有 `default` 一个池。
+
 | 组成部分 | 我们的实现 | 可替换的部分 |
 |---|---|---|
-| `Channel` | 每个 tier 一条，上面挂一条 Gate 链 | 队列后端。v1 只有 Redis sorted set |
-| `MergePolicy` | 优先级 + 老化 + 最低份额 | 合并策略本身。换实现时不改 worker |
-| Worker pool | 一组 goroutine，上限由 Gate 给出 | 上游客户端（`Upstream`） |
-| `Results` | 写出 `pipeline.Result` | 消费者。async 写 Redis 邮箱，batch 由 controller 收 |
+| `RequestChannel` | 每个 tier 一条，上面挂 Gate。Flow claim 之后写入 `Channel` | 队列后端。v1 只有 Redis sorted set |
+| `RequestMergePolicy` | 按池汇合。老化、优先级和最低份额在消费循环里决定下一次 claim | 合并策略本身。换实现时不改 worker |
+| Worker | Dispatcher 读 `PoolDispatch`，调用上游，把重试送进 `RetryChannel`，把终态送进 `ResultChannel` | 上游客户端（`Upstream`） |
+| `RetryChannel` | Flow 的 retry worker 按 `Backoff` 把请求停进 Redis。worker 送出重试后释放这一轮的 gate | 退避公式仍是 `internal/retry` |
+| `ResultChannel` | worker 先按 fencing 把终态写入 Redis，再把 `pipeline.Result` 送进这条通道 | 消费者。async 写 Redis 邮箱，batch 由 controller 收 |
 
 `pipeline.Result.ErrorCode` 使用 demo 已经公开的小写错误码（`deadline_exceeded`、`cancelled`、`upstream_error`、`max_attempts_exceeded`）。`RequestToken` 用来去掉重复投递。HTTP 层把 `Result` 翻译成现有的对外 JSON。
 
@@ -471,7 +501,7 @@ Batch HTTP 面保持现有路由：`/v1/files`、`/v1/batches` 的创建、查�
 | Async Processor 二进制 | `cmd/dispatcher` | 分叉 | 0.x 仍在改结果消息、指标名和头名。生产路径不嵌入上游进程。 |
 | 队列消息 + 内部信封（deadline、payload、metadata、代次） | `internal/pipeline` 的 `Message` 与 `Request` | 改造 | 概念对齐。类型、字段名和 JSON 由本仓库定义，不导入上游 package。偏移放在 `Metadata`。 |
 | Gate：`Budget` + 对单条请求的准入，以及闸门链 | `pipeline.Gate` 与 `ApplyChain` | 改造 | 同样的职责拆分。接口写在本仓库。demo 的 `Allow` 在 Phase 1 换成 `Gate`。 |
-| 把队列、合并策略、worker、结果串起来的 Flow | `pipeline.Flow` | 改造 | 装配方式对齐。合并策略自写，因为要保留老化。Redis、MySQL、HTTP 在 `cmd` 注入。 |
+| 把队列、合并策略、worker、结果串起来的 Flow | `pipeline.Flow`：`Characteristics`、`Start`、`StopConsuming`、`Shutdown`、`RequestChannels`、`RetryChannel`、`ResultChannel` | 改造 | 生命周期对齐。类型在本仓库。合并策略自写，因为要保留老化。dispatcher 调用这些方法编排消费，而不是自己持有 claim 循环。Redis、MySQL、HTTP 在 `cmd` 注入。 |
 | sorted set，score = deadline | `{prefix}:{pool}:q:{tier}`，score = `Message.Deadline` 的 Unix 秒 | 采用 | 同一秒用 id 排次序。 |
 | `redis-pubsub` | 不引入 | 分叉 | 上游已弃用，且没有队列级闸门。 |
 | Durable dequeue：peek → claim → ack，owner token | `claimed` member = `id\|RequestToken\|owner`，ack 前核对 | 改造 | 代次字段是我们的 `Request.RequestToken`。键名用 `lag:` 前缀。 |
@@ -630,7 +660,7 @@ Trace（W3C `traceparent` 放进 unit，跨进程不断）：
 - 在 `internal/pipeline` 落下第 3.5、3.6 节的类型。不新增对 llm-d module 的依赖，Go 版本保持仓库现有要求。
 - 新入队的消息改为 `pipeline.Request`。deadline 与 sorted set score 改为 Unix 秒。
 - Controller 用带 fencing token 的 Redis 锁选主。API 副本不再跑 reconcile。
-- Dispatcher 按 `pipeline.Flow` 装配。Phase 1 的 Gate 仍是本地并发加 Redis 共享计数，接口已经是 `pipeline.Gate`。
+- Dispatcher 按 `pipeline.Flow` 的生命周期编排：`Start`、`StopConsuming`、`Shutdown`，请求从 `RequestChannels` 经合并策略到 worker，重试走 `RetryChannel`。Phase 1 的 Gate 仍是本地并发加 Redis 共享计数，接口已经是 `pipeline.Gate`。
 - 队列键改为 `lag:{default}:q:async` 与 `lag:{default}:q:batch`。tier 字符串 `nearline` 改为 `async`。回收与提升脚本的键全部进入 `KEYS`。
 - `/metrics` 与 trace，覆盖第 5.6 节里不依赖 MySQL 的那些。
 - 文件和作业记录仍在 Redis。HTTP 路径与 JSON 字段保持兼容。

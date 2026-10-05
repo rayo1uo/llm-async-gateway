@@ -73,6 +73,56 @@ func sharedGate(st *store.Store, max, reserved int, lease time.Duration) pipelin
 	return budget.NewSharedGate(budget.SharedConfig{Local: lim, Store: st, Max: max, LeaseTTL: lease})
 }
 
+func TestFlowLifecycleStops(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	st := store.New(rdb, "lag")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	d := New(st, sharedGate(st, 2, 0, time.Second), &recordingUpstream{}, Options{
+		LeaseTTL: time.Second, PollInterval: 5 * time.Millisecond, RequestTimeout: time.Second,
+		ResultTTL: time.Hour, RetryBase: time.Millisecond, RetryMax: time.Millisecond, MaxAttempts: 2,
+	}, logger, nil)
+	flow := d.Flow()
+	if !flow.Characteristics().HasExternalBackoff || flow.Characteristics().SupportsMessageLatency {
+		t.Fatalf("characteristics=%+v", flow.Characteristics())
+	}
+	chans := flow.RequestChannels()
+	if len(chans) != 3 {
+		t.Fatalf("channels=%d", len(chans))
+	}
+	seen := map[pipeline.Tier]bool{}
+	for _, ch := range chans {
+		if ch.Gate == nil || ch.Channel == nil || ch.Queue == "" || ch.WorkerPoolID == "" {
+			t.Fatalf("incomplete channel %+v", ch)
+		}
+		seen[ch.Tier] = true
+	}
+	for _, tier := range []pipeline.Tier{pipeline.TierInteractive, pipeline.TierAsync, pipeline.TierBatch} {
+		if !seen[tier] {
+			t.Fatalf("missing tier %s", tier)
+		}
+	}
+	if flow.RetryChannel() == nil || flow.ResultChannel() == nil {
+		t.Fatal("missing retry or result channel")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	flow.StopConsuming()
+	flow.Shutdown()
+}
+
 func TestDispatcherUsesIdleBatchSlotWhenNearlineIsCapped(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

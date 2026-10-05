@@ -45,9 +45,10 @@ type Options struct {
 	Observer *observe.Observer
 }
 
-// Dispatcher leases queued requests. It is assembled as a pipeline.Flow:
-// merge selects a lane, the gate chain admits it, then a worker claims and calls upstream.
-// Several processes can run the loop. The shared gate caps global in-flight work.
+// Dispatcher runs inference workers on top of a pipeline.Flow.
+// The flow claims, admits, and parks retries. Workers call the upstream and
+// send retries and results back through the flow. Several processes can run
+// at once. The shared gate caps global in-flight work.
 type Dispatcher struct {
 	store *store.Store
 	gate  pipeline.Gate
@@ -57,8 +58,6 @@ type Dispatcher struct {
 	clk   clock.Clock
 	flow  *redisFlow
 	pool  string
-
-	wg sync.WaitGroup
 }
 
 // New builds a dispatcher. clk may be nil to use the wall clock.
@@ -73,21 +72,21 @@ func New(st *store.Store, gate pipeline.Gate, up Upstream, opts Options, logger 
 	if gate == nil {
 		gate = refuseGate{}
 	}
-	flow := newFlow(st, gate, opts, logger, clk)
 	pool := "default"
 	if st != nil && st.Pool() != "" {
 		pool = st.Pool()
 	}
-	return &Dispatcher{
+	d := &Dispatcher{
 		store: st,
 		gate:  gate,
 		up:    up,
 		opts:  opts,
 		log:   logger,
 		clk:   clk,
-		flow:  flow,
 		pool:  pool,
 	}
+	d.flow = newFlow(d)
+	return d
 }
 
 // Flow exposes the assembled pipeline. Tests and the process wiring use it.
@@ -101,19 +100,42 @@ func (refuseGate) Apply(context.Context, *pipeline.Request, *[]pipeline.ReleaseF
 	return pipeline.VerdictRefuse, nil
 }
 
-// Run polls until ctx is cancelled, then waits for in-flight attempts.
+// Run merges the flow's request channels, starts inference workers, then
+// starts the flow. Canceling ctx stops new claims. In-flight attempts finish,
+// and only then does the flow shut down its retry and result workers.
 func (d *Dispatcher) Run(ctx context.Context) {
-	d.tick(ctx)
-	ticker := time.NewTicker(d.opts.PollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			d.wg.Wait()
-			return
-		case <-ticker.C:
-			d.tick(context.Background())
-		}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out := d.flow.merge.MergeRequestChannels(d.flow.RequestChannels())
+	var wg sync.WaitGroup
+	for _, ch := range out.Channels {
+		wg.Add(1)
+		go func(ch <-chan pipeline.DispatchMessage) {
+			defer wg.Done()
+			d.serve(ch)
+		}(ch)
+	}
+	d.flow.Start(ctx)
+	<-ctx.Done()
+	d.flow.StopConsuming()
+	wg.Wait()
+	d.flow.Shutdown()
+}
+
+func (d *Dispatcher) serve(ch <-chan pipeline.DispatchMessage) {
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+	for msg := range ch {
+		inflight.Add(1)
+		go func(msg pipeline.DispatchMessage) {
+			defer inflight.Done()
+			defer pipeline.ReleaseAll(msg.Releases)
+			if msg.Request == nil {
+				return
+			}
+			d.process(unitFromRequest(msg.Request), msg.Owner)
+		}(msg)
 	}
 }
 
@@ -177,17 +199,16 @@ func (d *Dispatcher) drainExpired(ctx context.Context) {
 }
 
 func (d *Dispatcher) pump(ctx context.Context) {
-	channels := append([]pipeline.Channel(nil), d.flow.Channels()...)
+	channels := append([]pipeline.RequestChannel(nil), d.flow.sources...)
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		_, req, ok := d.flow.Merge().Next(ctx, channels)
+		ch, req, ok := d.flow.merge.Next(ctx, channels)
 		if !ok || req == nil {
 			return
 		}
 		tier := model.Tier(req.Message.Tier)
-		ch := channelFor(channels, req.Message.Tier)
 		owner, err := id.New("own_")
 		if err != nil {
 			d.log.Error("owner id", "err", err)
@@ -195,7 +216,7 @@ func (d *Dispatcher) pump(ctx context.Context) {
 		}
 		admitCtx := pipeline.WithAdmission(ctx, owner)
 		var releases []pipeline.ReleaseFunc
-		verdict, err := pipeline.ApplyChain(admitCtx, req, ch.Gates, &releases)
+		verdict, err := pipeline.ApplyChain(admitCtx, req, []pipeline.Gate{ch.Gate}, &releases)
 		if err != nil {
 			pipeline.ReleaseAll(releases)
 			d.log.Error("gate", "tier", tier, "err", err)
@@ -206,7 +227,11 @@ func (d *Dispatcher) pump(ctx context.Context) {
 			channels = withoutTier(channels, req.Message.Tier)
 			continue
 		}
-		_, claimSpan := d.startSpan(context.Background(), req.Message.Metadata[pipeline.MetaTraceparent], "dispatch.claim")
+		traceParent := ""
+		if req.Message.Metadata != nil {
+			traceParent = req.Message.Metadata[pipeline.MetaTraceparent]
+		}
+		_, claimSpan := d.startSpan(context.Background(), traceParent, "dispatch.claim")
 		unit, err := d.store.Claim(ctx, tier, d.clk.Now().Add(d.opts.LeaseTTL), owner)
 		claimSpan.End()
 		if err != nil || unit == nil {
@@ -217,41 +242,21 @@ func (d *Dispatcher) pump(ctx context.Context) {
 			return
 		}
 		if unit.TraceParent == "" {
-			unit.TraceParent = req.Message.Metadata[pipeline.MetaTraceparent]
+			unit.TraceParent = traceParent
 		}
-		d.flow.merge.Note(unit.Tier)
 		if d.opts.Observer != nil && d.opts.Observer.Metrics != nil {
 			d.opts.Observer.Metrics.ObserveClaim(d.pool, string(unit.Tier), unit.Created, unit.Deadline, d.clk.Now())
 		}
-		d.wg.Add(1)
-		go func(u *model.Unit, owner string, releases []pipeline.ReleaseFunc) {
-			defer d.wg.Done()
-			defer pipeline.ReleaseAll(releases)
-			d.process(u, owner)
-		}(unit, owner, releases)
-	}
-}
-
-func channelFor(channels []pipeline.Channel, tier pipeline.Tier) pipeline.Channel {
-	for _, ch := range channels {
-		if ch.Tier == tier {
-			return ch
+		claimed := store.PipelineRequest(unit, d.store.QueueKey(unit.Tier))
+		msg := pipeline.DispatchMessage{Request: &claimed, Owner: owner, Releases: releases}
+		select {
+		case <-ctx.Done():
+			pipeline.ReleaseAll(releases)
+			return
+		case ch.Channel <- msg:
+			d.flow.merge.Note(unit.Tier)
 		}
 	}
-	if len(channels) == 0 {
-		return pipeline.Channel{}
-	}
-	return channels[0]
-}
-
-func withoutTier(channels []pipeline.Channel, tier pipeline.Tier) []pipeline.Channel {
-	out := make([]pipeline.Channel, 0, len(channels))
-	for _, ch := range channels {
-		if ch.Tier != tier {
-			out = append(out, ch)
-		}
-	}
-	return out
 }
 
 func (d *Dispatcher) startSpan(ctx context.Context, traceparent, name string) (context.Context, *observe.Span) {
@@ -399,10 +404,8 @@ func (d *Dispatcher) process(u *model.Unit, owner string) {
 		}
 		return
 	}
-	if err := d.store.ParkRetry(ctx, u, owner, d.clk.Now().Add(delay)); err != nil {
-		d.log.Error("park retry", "id", u.ID, "err", err)
-		return
-	}
+	req := store.PipelineRequest(u, d.store.QueueKey(u.Tier))
+	d.flow.RetryChannel() <- pipeline.RetryMessage{Request: &req, Owner: owner, Backoff: delay}
 	d.countAttempt(u, "retry")
 	d.log.Info("retry scheduled", "id", u.ID, "pool", d.pool, "owner", owner, "attempt", u.Attempts, "delay", delay.String(), "status", status)
 }
@@ -548,14 +551,14 @@ func (d *Dispatcher) finish(ctx context.Context, u *model.Unit, owner string, re
 	if created {
 		d.countAttempt(u, attemptResult(res.Status))
 		d.observeTokens(u, res)
-		d.flow.emit(pipeline.Result{
+		d.flow.ResultChannel() <- pipeline.Result{
 			ID:           u.ID,
 			RequestToken: u.Token,
 			StatusCode:   res.StatusCode,
 			Payload:      append([]byte(nil), res.Body...),
 			ErrorCode:    res.ErrorCode,
 			ErrorMessage: res.ErrorMessage,
-		})
+		}
 	}
 	d.log.Info("request finished", "id", u.ID, "tier", u.Tier, "pool", d.pool, "owner", owner, "status", res.Status, "attempts", res.Attempts, "created", created)
 	return nil

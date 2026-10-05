@@ -15,7 +15,7 @@
 |---|---|
 | `gateway-api` | HTTP API。不跑 reconcile，也不派发 |
 | `batch-controller` | 用 Redis 锁和 fencing token 选主。只有 leader 校验并补货 |
-| `dispatcher` | 按 `pipeline.Flow` 领队列并调用上游 |
+| `dispatcher` | 驱动 `pipeline.Flow` 的 `Start` / `StopConsuming` / `Shutdown`，再调用上游 |
 
 `cmd/gateway` 把三个角色装进同一个进程，`make demo` 仍然用它。`docker compose up` 启动 2 个 API、2 个 dispatcher、1 个 controller 和 1 个 standby。API 副本不会推进 batch。
 
