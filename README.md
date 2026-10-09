@@ -132,9 +132,12 @@ internal/model       对外 JSON 文档
 internal/retry       退避和 Retry-After
 internal/schedule    nearline / batch 选择
 internal/store       Redis 存储和 Lua 脚本
+internal/supply      模型供给规划（纯函数，不在请求路径上）
 ```
 
 接口放在使用方：`dispatch.Budget` 和 `dispatch.Upstream`。存储是具体的 Redis 类型，测试用 miniredis，不另做一套假存储。
+
+副本计划不走上面的队列。`internal/supply.Plan` 只根据需求和各 GPU 类型的预算算出目标副本数，不访问 Redis，也不改 Deployment。规则见 [docs/model-supply-planning.md](docs/model-supply-planning.md)。
 
 ## Nearline API
 
@@ -285,7 +288,7 @@ make demo
 
 - 没有鉴权、租户配额，也不剥客户端自带的优先级头。
 - 文件字节存在 Redis 字符串里，没有 S3 生命周期，也没有 `output_expires_after`。
-- 不按 token 估算预算，只按请求数。长上下文会把闸门打歪。
+- 派发闸门不按 token 估算预算，只按请求数。长上下文会把闸门打歪。跨模型的副本计划在 `internal/supply`，不进这条请求路径。
 - 单实例 Redis。Lua 里用字符串拼队列键，不能直接丢进 Redis Cluster。
 - 结果键有 TTL。批输出文件本身不回收。
 - 取消会中止正在进行的上游调用，而不是等 OpenAI 那种最长约 10 分钟的排空。
