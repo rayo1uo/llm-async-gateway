@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capacity-forecast"
+version = "0.1.0"
+description = "CPU-only protected-demand forecast that publishes a serving GPU budget snapshot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "pyarrow>=14",
+  "statsforecast>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+capacity-forecast = "capacity_forecast.worker:main"
+capacity-forecast-backtest = "capacity_forecast.backtest:main"
+
+[tool.setuptools.packages.find]
+include = ["capacity_forecast*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+  "ignore:The 'generic' unit for NumPy timedelta:DeprecationWarning",
+]
