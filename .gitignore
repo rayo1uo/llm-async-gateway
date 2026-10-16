@@ -4,3 +4,8 @@
 *.exe
 *.test
 .DS_Store
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.venv/
+forecast/examples/

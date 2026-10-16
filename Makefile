@@ -1,4 +1,4 @@
-.PHONY: build test race vet lint ci demo up down
+.PHONY: build test race vet lint ci demo up down forecast-test
 
 build:
 	mkdir -p bin
@@ -18,6 +18,9 @@ lint:
 	golangci-lint run ./...
 
 ci: vet lint race
+
+forecast-test:
+	cd forecast && python3 -m pytest -q
 
 demo: build
 	bash scripts/demo.sh
